@@ -23,6 +23,7 @@ try:
         CommandHandler,
         CallbackQueryHandler,
         MessageHandler as TelegramMessageHandler,
+        CallbackQueryHandler,
         ContextTypes,
         filters,
     )
@@ -40,6 +41,7 @@ except ImportError:
     CommandHandler = Any
     CallbackQueryHandler = Any
     TelegramMessageHandler = Any
+    CallbackQueryHandler = Any
     HTTPXRequest = Any
     filters = None
     ParseMode = None
@@ -152,6 +154,11 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_conflict_count: int = 0
         self._polling_network_error_count: int = 0
         self._polling_error_callback_ref = None
+        # Clarify tool support: pending clarify requests waiting for user response.
+        # Key: session_key (str), Value: {"queue": queue.Queue, "chat_id": str, "message_id": str}
+        import queue as _queue_mod
+        self._clarify_queue_mod = _queue_mod
+        self._pending_clarify: Dict[str, Dict[str, Any]] = {}
         # DM Topics: map of topic_name -> message_thread_id (populated at startup)
         self._dm_topics: Dict[str, int] = {}
         # DM Topics config from extra.dm_topics
@@ -239,7 +246,7 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             await self._app.updater.start_polling(
                 allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=False,
+                    drop_pending_updates=True,
                 error_callback=self._polling_error_callback_ref,
             )
             logger.info(
@@ -286,7 +293,7 @@ class TelegramAdapter(BasePlatformAdapter):
             try:
                 await self._app.updater.start_polling(
                     allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=False,
+                    drop_pending_updates=True,
                     error_callback=self._polling_error_callback_ref,
                 )
                 logger.info("[%s] Telegram polling resumed after conflict retry %d", self.name, self._polling_conflict_count)
@@ -611,7 +618,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
                 self._handle_media_message
             ))
-            # Handle inline keyboard button callbacks (update prompts)
+            # Handle inline keyboard button presses (clarify tool responses)
             self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
             
             # Start polling — retry initialize() for transient TLS resets
@@ -806,6 +813,201 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         else:  # "first" (default)
             return chunk_index == 0
+
+    # ------------------------------------------------------------------
+    # Clarify tool support: inline keyboard buttons + callback queries
+    # ------------------------------------------------------------------
+
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[List[str]],
+        session_key: str,
+        thread_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Send a clarify question with inline keyboard buttons.
+
+        Returns the message_id of the sent message (for later cleanup).
+        For open-ended questions (no choices), sends a plain text prompt.
+        """
+        if not self._bot:
+            return None
+
+        # Build inline keyboard with choices
+        keyboard = []
+        if choices:
+            for i, choice in enumerate(choices):
+                # Truncate long labels for button text (Telegram limit: 64 bytes)
+                label = choice if len(choice) <= 60 else choice[:57] + "..."
+                callback_data = f"clarify:{session_key[:40]}:{i}"
+                # Telegram callback_data max is 64 bytes
+                if len(callback_data.encode('utf-8')) > 64:
+                    callback_data = f"clarify:{session_key[:20]}:{i}"
+                keyboard.append([InlineKeyboardButton(label, callback_data=callback_data)])
+            # Add "Other" option for freetext
+            other_data = f"clarify:{session_key[:40]}:other"
+            if len(other_data.encode('utf-8')) > 64:
+                other_data = f"clarify:{session_key[:20]}:other"
+            keyboard.append([InlineKeyboardButton("✏️ Other (type your answer)", callback_data=other_data)])
+            reply_markup = InlineKeyboardMarkup(keyboard)
+        else:
+            reply_markup = None
+
+        # Format the question text
+        if choices:
+            text = f"❓ {question}"
+        else:
+            text = f"❓ {question}\n\n_Type your answer below:_"
+
+        effective_thread_id = int(thread_id) if thread_id else None
+
+        try:
+            try:
+                logger.info("[%s] Sending clarify (MarkdownV2) to chat=%s, choices=%d, thread=%s",
+                            self.name, chat_id, len(choices) if choices else 0, thread_id)
+                msg = await self._bot.send_message(
+                    chat_id=int(chat_id),
+                    text=self.format_message(text),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    reply_markup=reply_markup,
+                    message_thread_id=effective_thread_id,
+                )
+            except Exception as md_err:
+                # Fallback: plain text
+                logger.warning("[%s] Clarify MarkdownV2 failed (%s), falling back to plain text", self.name, md_err)
+                msg = await self._bot.send_message(
+                    chat_id=int(chat_id),
+                    text=text,
+                    reply_markup=reply_markup,
+                    message_thread_id=effective_thread_id,
+                )
+            logger.info("[%s] Clarify message sent successfully, msg_id=%s", self.name, msg.message_id)
+            return str(msg.message_id)
+        except Exception as e:
+            logger.error("[%s] Failed to send clarify message: %s", self.name, e)
+            return None
+
+    async def _handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle inline keyboard button presses for clarify tool."""
+        query = update.callback_query
+        if not query or not query.data:
+            return
+
+        data = query.data
+        if not data.startswith("clarify:"):
+            await query.answer()
+            return
+
+        # Parse callback data: "clarify:<session_key>:<choice_index_or_other>"
+        parts = data.split(":", 2)
+        if len(parts) < 3:
+            await query.answer("Invalid callback data")
+            return
+
+        _, session_prefix, choice_part = parts
+
+        # Find the matching pending clarify by session prefix
+        matching_key = None
+        for sk in self._pending_clarify:
+            if sk.startswith(session_prefix) or session_prefix.startswith(sk[:len(session_prefix)]):
+                matching_key = sk
+                break
+
+        if not matching_key or matching_key not in self._pending_clarify:
+            await query.answer("This question has expired.")
+            return
+
+        pending = self._pending_clarify[matching_key]
+        choices = pending.get("choices", [])
+
+        if choice_part == "other":
+            # User wants to type a custom answer — set freetext mode
+            pending["freetext"] = True
+            await query.answer()
+            # Update the message to indicate freetext mode
+            try:
+                await self._bot.edit_message_text(
+                    chat_id=query.message.chat_id,
+                    message_id=query.message.message_id,
+                    text=f"❓ {pending.get('question', 'Question')}\n\n✏️ Type your answer below:",
+                )
+            except Exception:
+                pass
+            return
+
+        # Standard choice selection
+        try:
+            choice_idx = int(choice_part)
+            if 0 <= choice_idx < len(choices):
+                response = choices[choice_idx]
+            else:
+                response = choice_part
+        except ValueError:
+            response = choice_part
+
+        # Acknowledge the button press
+        await query.answer(f"Selected: {response[:50]}")
+
+        # Update the message to show the selection (remove keyboard)
+        try:
+            await self._bot.edit_message_text(
+                chat_id=query.message.chat_id,
+                message_id=query.message.message_id,
+                text=f"❓ {pending.get('question', 'Question')}\n\n✅ {response}",
+            )
+        except Exception:
+            pass
+
+        # Deliver the response to the waiting agent thread
+        q = pending.get("queue")
+        if q:
+            q.put(response)
+
+    def has_pending_clarify(self, session_key: str) -> bool:
+        """Check if a session has a pending clarify waiting for response."""
+        return session_key in self._pending_clarify
+
+    def route_clarify_response(self, session_key: str, text: str) -> bool:
+        """Route a text message as a clarify response if one is pending.
+
+        Returns True if the message was consumed by a pending clarify,
+        False if no clarify was pending (normal processing should continue).
+        """
+        if session_key not in self._pending_clarify:
+            return False
+
+        pending = self._pending_clarify[session_key]
+
+        # Only accept text if we're in freetext mode (open-ended or "Other" selected)
+        is_open_ended = not pending.get("choices")
+        is_freetext = pending.get("freetext", False)
+
+        if not is_open_ended and not is_freetext:
+            # Choices are pending — text should be treated normally
+            # (user should tap a button, not type)
+            return False
+
+        # Deliver the text response
+        q = pending.get("queue")
+        if q:
+            q.put(text)
+
+        # Clean up the keyboard message
+        try:
+            msg_id = pending.get("message_id")
+            chat_id = pending.get("chat_id")
+            question = pending.get("question", "Question")
+            if msg_id and chat_id:
+                asyncio.ensure_future(self._bot.edit_message_text(
+                    chat_id=int(chat_id),
+                    message_id=int(msg_id),
+                    text=f"❓ {question}\n\n✅ {text[:100]}",
+                ))
+        except Exception:
+            pass
+
+        return True
 
     async def send(
         self,

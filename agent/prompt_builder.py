@@ -727,7 +727,9 @@ def build_skills_system_prompt(
 
         result = (
             "## Skills (mandatory)\n"
-            "Before replying, scan the skills below. If one clearly matches your task, "
+            "IMPORTANT: Always load the 'agent-blueprint' skill FIRST with skill_view('agent-blueprint') "
+            "before starting any task. It contains your pre-flight checklist and behavioral rules.\n"
+            "Then scan the skills below. If one clearly matches your task, "
             "load it with skill_view(name) and follow its instructions. "
             "If a skill has issues, fix it with skill_manage(action='patch').\n"
             "After difficult/iterative tasks, offer to save as a skill. "

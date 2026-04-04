@@ -6236,6 +6236,11 @@ class HermesCLI:
             _pl = get_tool_preview_max_len()
             if _pl > 0 and len(label) > _pl:
                 label = label[:_pl - 3] + "..."
+            # Hard cap for the spinner widget — it's a single status line,
+            # so extremely long previews (e.g. clarify questions) are useless.
+            _SPINNER_MAX = 80
+            if len(label) > _SPINNER_MAX:
+                label = label[:_SPINNER_MAX - 3] + "..."
             self._spinner_text = f"{emoji} {label}"
             self._tool_start_time = _time.monotonic()
             self._invalidate()
@@ -6711,13 +6716,49 @@ class HermesCLI:
         # Open-ended questions skip straight to freetext input
         self._clarify_freetext = is_open_ended
 
+        # Print the question text to the persistent terminal output so it
+        # stays in scroll history. The interactive panel below will show
+        # only the answer choices — keeping the panel compact and readable
+        # (especially on mobile / narrow terminals).
+        import shutil as _shutil, textwrap as _textwrap
+        _q_color = "\033[38;2;255;215;0m"   # gold — matches clarify-title
+        _q_border = "\033[38;2;205;127;50m"  # bronze — matches clarify-border
+        _q_text = "\033[38;2;255;248;220m"   # cornsilk — matches clarify-question
+        _term_w = _shutil.get_terminal_size((80, 24)).columns
+        # Reserve 6 chars for "  │ " prefix (4) + some margin (2)
+        _wrap_w = max(20, _term_w - 6)
+        # Build the entire box as a single string so prompt_toolkit doesn't
+        # repaint the interactive panel between each line (race condition
+        # causes "╭─ Your input needed" to interleave with every question line).
+        _box_lines = [f"\n{_q_border}  ╭─ {_q_color}Hermes asks:{_RST}"]
+        for _line in question.split("\n"):
+            if not _line.strip():
+                _box_lines.append(f"{_q_border}  │{_RST}")
+            else:
+                _wrapped = _textwrap.wrap(
+                    _line, width=_wrap_w,
+                    break_long_words=False, break_on_hyphens=False,
+                )
+                for _wl in (_wrapped or [_line]):
+                    _box_lines.append(f"{_q_border}  │ {_q_text}{_wl}{_RST}")
+        _box_lines.append(f"{_q_border}  ╰─{_RST}\n")
+        _cprint("\n".join(_box_lines))
+
+        # Play a notification sound so the user knows a question was asked.
+        # Uses Windows SystemSounds via powershell.exe (works from WSL).
+        try:
+            import subprocess as _sp
+            _sp.Popen(
+                ["powershell.exe", "-NoProfile", "-Command",
+                 "[System.Media.SystemSounds]::Exclamation.Play()"],
+                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+            )
+        except Exception:
+            pass  # Sound is best-effort; never block the clarify flow
+
         # Trigger prompt_toolkit repaint from this (non-main) thread
         self._invalidate()
 
-        # Poll for the user's response.  The countdown in the hint line
-        # updates on each invalidate — but frequent repaints cause visible
-        # flicker in some terminals (Kitty, ghostty).  We only refresh the
-        # countdown every 5 s; selection changes (↑/↓) trigger instant
         # Poll for the user's response.  The countdown in the hint line
         # updates on each invalidate — but frequent repaints cause visible
         # flicker in some terminals (Kitty, ghostty).  We only refresh the
@@ -6728,6 +6769,13 @@ class HermesCLI:
             try:
                 result = response_queue.get(timeout=1)
                 self._clarify_deadline = 0
+                # Print Q&A summary to persistent terminal output (agent thread,
+                # so it prints in sequence with subsequent agent output).
+                _q_short = question.split('\n')[0][:80]
+                if len(question) > 80 or '\n' in question:
+                    _q_short += "..."
+                _cprint(f"  {_DIM}Q: {_q_short}{_RST}")
+                _cprint(f"  {_GOLD}A: {result}{_RST}\n")
                 return result
             except queue.Empty:
                 remaining = self._clarify_deadline - _time.monotonic()
@@ -6738,16 +6786,17 @@ class HermesCLI:
                 if now - _last_countdown_refresh >= 5.0:
                     _last_countdown_refresh = now
                     self._invalidate()
-                if now - _last_countdown_refresh >= 5.0:
-                    _last_countdown_refresh = now
-                    self._invalidate()
 
         # Timed out — tear down the UI and let the agent decide
+        _q_short = question.split('\n')[0][:80]
+        if len(question) > 80 or '\n' in question:
+            _q_short += "..."
         self._clarify_state = None
         self._clarify_freetext = False
         self._clarify_deadline = 0
         self._invalidate()
-        _cprint(f"\n{_DIM}(clarify timed out after {timeout}s — agent will decide){_RST}")
+        _cprint(f"  {_DIM}Q: {_q_short}{_RST}")
+        _cprint(f"  {_DIM}A: (timed out after {timeout}s — agent will decide){_RST}\n")
         return (
             "The user did not provide a response within the time limit. "
             "Use your best judgement to make the choice and proceed."
@@ -8475,14 +8524,24 @@ class HermesCLI:
             return inner + 2  # account for the single leading/trailing spaces inside borders
 
         def _wrap_panel_text(text: str, width: int, subsequent_indent: str = "") -> list[str]:
-            wrapped = textwrap.wrap(
-                text,
-                width=max(8, width),
-                break_long_words=False,
-                break_on_hyphens=False,
-                subsequent_indent=subsequent_indent,
-            )
-            return wrapped or [""]
+            # Split on newlines FIRST so intentional line breaks, bullet points,
+            # and blank separator lines are preserved. Then wrap each line
+            # individually for long-line handling.
+            result = []
+            for paragraph in text.split("\n"):
+                if not paragraph.strip():
+                    # Blank line -> empty string (rendered as blank panel row)
+                    result.append("")
+                else:
+                    wrapped = textwrap.wrap(
+                        paragraph,
+                        width=max(8, width),
+                        break_long_words=False,
+                        break_on_hyphens=False,
+                        subsequent_indent=subsequent_indent,
+                    )
+                    result.extend(wrapped or [paragraph])
+            return result or [""]
 
         def _append_panel_line(lines, border_style: str, content_style: str, text: str, box_width: int) -> None:
             inner_width = max(0, box_width - 2)
@@ -8493,8 +8552,62 @@ class HermesCLI:
         def _append_blank_panel_line(lines, border_style: str, box_width: int) -> None:
             lines.append((border_style, "│" + (" " * box_width) + "│\n"))
 
+        def _parse_markdown_line(text: str, base_style: str) -> list[tuple]:
+            """Parse a single line of text for inline markdown and return styled tuples.
+
+            Supports:
+            - **bold** -> clarify-bold
+            - *italic* -> clarify-italic
+            - # Heading / ## Heading -> clarify-heading
+            Everything else uses base_style.
+            """
+            import re
+            # Handle headings: lines starting with # or ##
+            heading_match = re.match(r'^(#{1,2})\s+(.+)$', text.strip())
+            if heading_match:
+                return [('class:clarify-heading', text)]
+
+            # Parse inline bold (**text**) and italic (*text*)
+            # Pattern: **bold**, *italic*, or plain text
+            parts = []
+            # Split by bold first (**...**), then italic (*...*)
+            pattern = re.compile(r'(\*\*(.+?)\*\*|\*(.+?)\*)')
+            last_end = 0
+            for m in pattern.finditer(text):
+                # Add plain text before this match
+                if m.start() > last_end:
+                    parts.append((base_style, text[last_end:m.start()]))
+                if m.group(2):  # **bold**
+                    parts.append(('class:clarify-bold', m.group(2)))
+                elif m.group(3):  # *italic*
+                    parts.append(('class:clarify-italic', m.group(3)))
+                last_end = m.end()
+            # Add remaining plain text
+            if last_end < len(text):
+                parts.append((base_style, text[last_end:]))
+            return parts if parts else [(base_style, text)]
+
+        def _append_markdown_panel_line(lines, border_style: str, base_style: str, text: str, box_width: int) -> None:
+            """Like _append_panel_line but parses markdown for inline styling."""
+            inner_width = max(0, box_width - 2)
+            lines.append((border_style, "│ "))
+            styled_parts = _parse_markdown_line(text, base_style)
+            # Calculate visible text length (without style info)
+            visible_len = sum(len(part[1]) for part in styled_parts)
+            lines.extend(styled_parts)
+            # Pad to fill the panel width
+            if visible_len < inner_width:
+                lines.append((base_style, ' ' * (inner_width - visible_len)))
+            lines.append((border_style, " │\n"))
+
         def _get_clarify_display():
-            """Build styled text for the clarify question/choices panel."""
+            """Build styled text for the clarify question/choices panel.
+
+            The question text is printed to the persistent terminal output by
+            _clarify_callback.  This panel displays ONLY the selectable choices
+            so it stays compact and choices are always visible — especially on
+            narrow/mobile terminals.
+            """
             state = cli_ref._clarify_state
             if not state:
                 return []
@@ -8502,7 +8615,9 @@ class HermesCLI:
             question = state["question"]
             choices = state.get("choices") or []
             selected = state.get("selected", 0)
-            preview_lines = _wrap_panel_text(question, 60)
+
+            # Build preview lines for width calculation (choices only)
+            preview_lines = []
             for i, choice in enumerate(choices):
                 prefix = "❯ " if i == selected and not cli_ref._clarify_freetext else "  "
                 preview_lines.extend(_wrap_panel_text(f"{prefix}{choice}", 60, subsequent_indent="  "))
@@ -8512,19 +8627,16 @@ class HermesCLI:
                 else "  Other (type your answer)"
             )
             preview_lines.extend(_wrap_panel_text(other_label, 60, subsequent_indent="  "))
-            box_width = _panel_box_width("Hermes needs your input", preview_lines)
+
+            panel_title = "Select an option" if choices else "Your input needed"
+            box_width = _panel_box_width(panel_title, preview_lines)
             inner_text_width = max(8, box_width - 2)
 
             lines = []
             # Box top border
             lines.append(('class:clarify-border', '╭─ '))
-            lines.append(('class:clarify-title', 'Hermes needs your input'))
-            lines.append(('class:clarify-border', ' ' + ('─' * max(0, box_width - len("Hermes needs your input") - 3)) + '╮\n'))
-            _append_blank_panel_line(lines, 'class:clarify-border', box_width)
-
-            # Question text
-            for wrapped in _wrap_panel_text(question, inner_text_width):
-                _append_panel_line(lines, 'class:clarify-border', 'class:clarify-question', wrapped, box_width)
+            lines.append(('class:clarify-title', panel_title))
+            lines.append(('class:clarify-border', ' ' + ('─' * max(0, box_width - len(panel_title) - 3)) + '╮\n'))
             _append_blank_panel_line(lines, 'class:clarify-border', box_width)
 
             if cli_ref._clarify_freetext and not choices:
@@ -8758,7 +8870,10 @@ class HermesCLI:
             # Clarify question panel
             'clarify-border': '#CD7F32',
             'clarify-title': '#FFD700 bold',
-            'clarify-question': '#FFF8DC bold',
+            'clarify-question': '#FFF8DC',
+            'clarify-bold': '#FFF8DC bold',
+            'clarify-italic': '#FFF8DC italic',
+            'clarify-heading': '#FFD700 bold',
             'clarify-choice': '#AAAAAA',
             'clarify-selected': '#FFD700 bold',
             'clarify-active-other': '#FFD700 italic',

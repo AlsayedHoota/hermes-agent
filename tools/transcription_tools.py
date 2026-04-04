@@ -310,40 +310,162 @@ def _validate_audio_file(file_path: str) -> Optional[Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
-    """Transcribe using faster-whisper (local, free)."""
+def _get_or_load_model(model_name: str):
+    """Load a faster-whisper model, caching by name."""
     global _local_model, _local_model_name
+    from faster_whisper import WhisperModel
 
+    if _local_model is None or _local_model_name != model_name:
+        logger.info("Loading faster-whisper model '%s' (first load downloads the model)...", model_name)
+        _local_model = WhisperModel(model_name, device="auto", compute_type="auto")
+        _local_model_name = model_name
+    return _local_model
+
+
+# Secondary model cache so cascading doesn't evict the primary model
+_cascade_model: Optional[object] = None
+_cascade_model_name: Optional[str] = None
+
+# Cascading STT config
+CASCADE_FAST_MODEL = "base"
+CASCADE_ACCURATE_MODEL = "turbo"
+CASCADE_MIN_AVG_LOG_PROB = -0.6      # Below this → low confidence
+CASCADE_MIN_NO_SPEECH_THRESH = 0.4   # Above this → likely not speech
+CASCADE_MIN_TRANSCRIPT_LEN = 2       # Very short results are suspect
+
+
+def _assess_transcript_quality(segments_data: list, info) -> tuple[bool, str]:
+    """Assess whether a transcription looks reliable.
+
+    Returns (is_reliable, reason).
+    """
+    if not segments_data:
+        return False, "no segments produced"
+
+    transcript = " ".join(s["text"] for s in segments_data).strip()
+    if len(transcript) < CASCADE_MIN_TRANSCRIPT_LEN:
+        return False, f"transcript too short ({len(transcript)} chars)"
+
+    # Check average log probability across segments
+    avg_log_probs = [s["avg_log_prob"] for s in segments_data if s["avg_log_prob"] is not None]
+    if avg_log_probs:
+        overall_avg = sum(avg_log_probs) / len(avg_log_probs)
+        if overall_avg < CASCADE_MIN_AVG_LOG_PROB:
+            return False, f"low avg_log_prob ({overall_avg:.2f} < {CASCADE_MIN_AVG_LOG_PROB})"
+
+    # Check no_speech_probability
+    no_speech_probs = [s["no_speech_prob"] for s in segments_data if s["no_speech_prob"] is not None]
+    if no_speech_probs:
+        max_no_speech = max(no_speech_probs)
+        if max_no_speech > CASCADE_MIN_NO_SPEECH_THRESH:
+            return False, f"high no_speech_prob ({max_no_speech:.2f} > {CASCADE_MIN_NO_SPEECH_THRESH})"
+
+    # Check language detection confidence
+    if hasattr(info, 'language_probability') and info.language_probability < 0.5:
+        return False, f"low language confidence ({info.language_probability:.2f})"
+
+    return True, "OK"
+
+
+def _transcribe_with_model(file_path: str, model_name: str, use_cache: str = "primary"):
+    """Run transcription with a specific model, returning segments data + info.
+
+    use_cache: 'primary' uses _local_model cache, 'cascade' uses _cascade_model cache.
+    """
+    global _cascade_model, _cascade_model_name
+
+    from faster_whisper import WhisperModel
+
+    if use_cache == "cascade":
+        if _cascade_model is None or _cascade_model_name != model_name:
+            logger.info("Loading cascade model '%s'...", model_name)
+            _cascade_model = WhisperModel(model_name, device="auto", compute_type="auto")
+            _cascade_model_name = model_name
+        model = _cascade_model
+    else:
+        model = _get_or_load_model(model_name)
+
+    # Language: config.yaml (stt.local.language) > env var > auto-detect.
+    _forced_lang = (
+        _load_stt_config().get("local", {}).get("language")
+        or os.getenv(LOCAL_STT_LANGUAGE_ENV)
+        or None
+    )
+    transcribe_kwargs = {"beam_size": 5}
+    if _forced_lang:
+        transcribe_kwargs["language"] = _forced_lang
+
+    segments, info = model.transcribe(file_path, **transcribe_kwargs)
+
+    segments_data = []
+    for seg in segments:
+        segments_data.append({
+            "text": seg.text.strip(),
+            "avg_log_prob": seg.avg_logprob if hasattr(seg, 'avg_logprob') else None,
+            "no_speech_prob": seg.no_speech_prob if hasattr(seg, 'no_speech_prob') else None,
+        })
+
+    transcript = " ".join(s["text"] for s in segments_data)
+    return transcript, segments_data, info
+
+
+def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
+    """Transcribe using faster-whisper (local, free).
+
+    When model_name is 'turbo', uses a cascading strategy: first tries the
+    fast 'base' model, then escalates to 'turbo' only if quality is low.
+    This saves time on clear audio while keeping accuracy as a safety net.
+    """
     if not _HAS_FASTER_WHISPER:
         return {"success": False, "transcript": "", "error": "faster-whisper not installed"}
 
     try:
-        from faster_whisper import WhisperModel
-        # Lazy-load the model (downloads on first use, ~150 MB for 'base')
-        if _local_model is None or _local_model_name != model_name:
-            logger.info("Loading faster-whisper model '%s' (first load downloads the model)...", model_name)
-            _local_model = WhisperModel(model_name, device="auto", compute_type="auto")
-            _local_model_name = model_name
+        use_cascade = model_name == CASCADE_ACCURATE_MODEL
 
-        # Language: config.yaml (stt.local.language) > env var > auto-detect.
-        _forced_lang = (
-            _load_stt_config().get("local", {}).get("language")
-            or os.getenv(LOCAL_STT_LANGUAGE_ENV)
-            or None
-        )
-        transcribe_kwargs = {"beam_size": 5}
-        if _forced_lang:
-            transcribe_kwargs["language"] = _forced_lang
+        if use_cascade:
+            # --- Pass 1: fast model ---
+            logger.info("Cascade STT: trying fast model '%s' first...", CASCADE_FAST_MODEL)
+            transcript, segments_data, info = _transcribe_with_model(
+                file_path, CASCADE_FAST_MODEL, use_cache="primary"
+            )
 
-        segments, info = _local_model.transcribe(file_path, **transcribe_kwargs)
-        transcript = " ".join(segment.text.strip() for segment in segments)
+            is_reliable, reason = _assess_transcript_quality(segments_data, info)
 
-        logger.info(
-            "Transcribed %s via local whisper (%s, lang=%s, %.1fs audio)",
-            Path(file_path).name, model_name, info.language, info.duration,
-        )
+            if is_reliable:
+                logger.info(
+                    "Cascade STT: '%s' result accepted (quality: %s) — skipping '%s'. "
+                    "Transcribed %s (lang=%s, %.1fs audio)",
+                    CASCADE_FAST_MODEL, reason, CASCADE_ACCURATE_MODEL,
+                    Path(file_path).name, info.language, info.duration,
+                )
+                return {"success": True, "transcript": transcript, "provider": "local",
+                        "model_used": CASCADE_FAST_MODEL, "cascade": "fast_accepted"}
 
-        return {"success": True, "transcript": transcript, "provider": "local"}
+            # --- Pass 2: accurate model ---
+            logger.info(
+                "Cascade STT: '%s' result unreliable (%s) — escalating to '%s'...",
+                CASCADE_FAST_MODEL, reason, CASCADE_ACCURATE_MODEL,
+            )
+            transcript, segments_data, info = _transcribe_with_model(
+                file_path, CASCADE_ACCURATE_MODEL, use_cache="cascade"
+            )
+            logger.info(
+                "Cascade STT: used '%s' for %s (lang=%s, %.1fs audio)",
+                CASCADE_ACCURATE_MODEL, Path(file_path).name, info.language, info.duration,
+            )
+            return {"success": True, "transcript": transcript, "provider": "local",
+                    "model_used": CASCADE_ACCURATE_MODEL, "cascade": "escalated"}
+
+        else:
+            # --- Non-cascading: use the requested model directly ---
+            transcript, segments_data, info = _transcribe_with_model(
+                file_path, model_name, use_cache="primary"
+            )
+            logger.info(
+                "Transcribed %s via local whisper (%s, lang=%s, %.1fs audio)",
+                Path(file_path).name, model_name, info.language, info.duration,
+            )
+            return {"success": True, "transcript": transcript, "provider": "local"}
 
     except Exception as e:
         logger.error("Local transcription failed: %s", e, exc_info=True)

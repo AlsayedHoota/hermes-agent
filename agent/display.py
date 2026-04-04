@@ -958,6 +958,12 @@ def get_cute_tool_message(
         if tasks and isinstance(tasks, list):
             return _wrap(f"┊ 🔀 delegate  {len(tasks)} parallel tasks  {dur}")
         return _wrap(f"┊ 🔀 delegate  {_trunc(args.get('goal', ''), 35)}  {dur}")
+    if tool_name == "clarify":
+        q = _oneline(args.get("question", ""))
+        q = (q[:35] + "...") if len(q) > 35 else q
+        choices = args.get("choices")
+        label = f"{len(choices)} choices" if choices else "open-ended"
+        return _wrap(f"┊ ❓ clarify   \"{q}\" ({label})  {dur}")
 
     preview = build_tool_preview(tool_name, args) or ""
     return _wrap(f"┊ ⚡ {tool_name[:9]:9} {_trunc(preview, 35)}  {dur}")

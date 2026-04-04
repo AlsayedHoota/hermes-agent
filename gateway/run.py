@@ -2276,6 +2276,16 @@ class GatewayRunner:
                 self._running_agents_ts.pop(_quick_key, None)
 
         if _quick_key in self._running_agents:
+            # Check if there's a pending clarify question for this session.
+            # If so, route the user's text response to the clarify callback
+            # instead of treating it as an interrupt.
+            if event.text and not event.get_command():
+                adapter = self.adapters.get(source.platform)
+                if adapter and hasattr(adapter, 'route_clarify_response'):
+                    if adapter.route_clarify_response(_quick_key, event.text):
+                        logger.debug("Routed message to pending clarify for session %s", _quick_key[:20])
+                        return None
+
             if event.get_command() == "status":
                 return await self._handle_status_command(event)
 
@@ -7193,6 +7203,122 @@ class GatewayRunner:
             except Exception as _e:
                 logger.debug("status_callback error (%s): %s", event_type, _e)
 
+        # Clarify callback: sends question + choices to the platform (e.g. Telegram
+        # inline keyboard) and blocks the sync thread until the user responds.
+        _clarify_adapter = self.adapters.get(source.platform)
+        _clarify_chat_id = source.chat_id
+        _clarify_thread_id = _progress_thread_id
+        _clarify_session_key = session_key
+
+        def _clarify_callback_sync(question: str, choices: list) -> str:
+            """Gateway clarify callback — bridges sync agent thread to async platform."""
+            import time as _time
+
+            # Read timeout from config.yaml (same as CLI), default 120s
+            _clarify_cfg = user_config.get("clarify", {})
+            timeout = int(_clarify_cfg.get("timeout", 120))
+            response_queue = queue.Queue()
+            is_open_ended = not choices or len(choices) == 0
+
+            # Check if the adapter supports interactive clarify (e.g. Telegram inline keyboards)
+            if _clarify_adapter and hasattr(_clarify_adapter, 'send_clarify'):
+                logger.info("Clarify callback invoked: question=%r, choices=%d, session=%s",
+                            question[:80], len(choices) if choices else 0, _clarify_session_key[:30])
+                # Register pending clarify state on the adapter
+                pending_state = {
+                    "queue": response_queue,
+                    "question": question,
+                    "choices": choices if not is_open_ended else [],
+                    "chat_id": _clarify_chat_id,
+                    "freetext": is_open_ended,
+                }
+                _clarify_adapter._pending_clarify[_clarify_session_key] = pending_state
+
+                # Send the clarify message asynchronously
+                try:
+                    future = asyncio.run_coroutine_threadsafe(
+                        _clarify_adapter.send_clarify(
+                            chat_id=_clarify_chat_id,
+                            question=question,
+                            choices=choices if not is_open_ended else None,
+                            session_key=_clarify_session_key,
+                            thread_id=str(_clarify_thread_id) if _clarify_thread_id else None,
+                        ),
+                        _loop_for_step,
+                    )
+                    msg_id = future.result(timeout=15)  # wait up to 15s for the message to send
+                    if msg_id:
+                        pending_state["message_id"] = msg_id
+                        logger.info("Clarify message delivered, msg_id=%s, waiting for response (timeout=%ds)", msg_id, timeout)
+                    else:
+                        logger.warning("Clarify send returned None (no msg_id) — message may not have been delivered")
+                except Exception as _send_err:
+                    logger.error("Failed to send clarify message: %s", _send_err)
+                    _clarify_adapter._pending_clarify.pop(_clarify_session_key, None)
+                    return "The clarify question could not be delivered. Use your best judgement."
+
+                # Block waiting for user response
+                deadline = _time.monotonic() + timeout
+                while True:
+                    try:
+                        result = response_queue.get(timeout=2)
+                        # Clean up pending state
+                        _clarify_adapter._pending_clarify.pop(_clarify_session_key, None)
+                        return result
+                    except queue.Empty:
+                        remaining = deadline - _time.monotonic()
+                        if remaining <= 0:
+                            break
+
+                # Timed out — clean up
+                _clarify_adapter._pending_clarify.pop(_clarify_session_key, None)
+                logger.warning("Clarify timed out after %ds for session %s", timeout, _clarify_session_key[:30])
+                # Remove the keyboard from the message
+                try:
+                    msg_id = pending_state.get("message_id")
+                    if msg_id:
+                        asyncio.run_coroutine_threadsafe(
+                            _clarify_adapter._bot.edit_message_text(
+                                chat_id=int(_clarify_chat_id),
+                                message_id=int(msg_id),
+                                text=f"❓ {question}\n\n⏰ Timed out ({timeout}s)",
+                            ),
+                            _loop_for_step,
+                        )
+                except Exception:
+                    pass
+
+                return (
+                    "The user did not provide a response within the time limit. "
+                    "Use your best judgement to make the choice and proceed."
+                )
+
+            else:
+                # Fallback for platforms without interactive clarify:
+                # Send a plain-text question and wait for a text reply
+                try:
+                    if choices:
+                        choices_text = "\n".join(f"  {i+1}. {c}" for i, c in enumerate(choices))
+                        msg = f"❓ {question}\n\n{choices_text}\n\nReply with a number or type your answer:"
+                    else:
+                        msg = f"❓ {question}\n\nType your answer:"
+
+                    asyncio.run_coroutine_threadsafe(
+                        _status_adapter.send(
+                            _clarify_chat_id,
+                            msg,
+                            metadata=_status_thread_metadata,
+                        ),
+                        _loop_for_step,
+                    )
+                except Exception:
+                    pass
+
+                return (
+                    "The clarify question was sent but this platform doesn't support "
+                    "interactive responses. Use your best judgement."
+                )
+
         def run_sync():
             # The conditional re-assignment of `message` further below
             # (prepending model-switch notes) makes Python treat it as a
@@ -7335,6 +7461,7 @@ class GatewayRunner:
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
             agent.status_callback = _status_callback_sync
+            agent.clarify_callback = _clarify_callback_sync
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides")
