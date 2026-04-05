@@ -700,6 +700,17 @@ Write only the summary body. Do not include any preamble or prefix."""
                     (msg.get("content") or "")
                     + "\n\n[Note: Some earlier conversation turns have been compacted into a handoff summary to preserve context space. The current session state may still reflect earlier work, so build on that summary and state rather than re-doing work.]"
                 )
+            elif msg.get("role") in ("user", "assistant") and not msg.get("tool_calls"):
+                # Mark preserved head messages as historical so the model
+                # doesn't re-address old user requests after compaction.
+                # Without this, the model may treat the first user message
+                # as a new/pending request and deviate from current work.
+                content = msg.get("content") or ""
+                if content and not content.startswith("[HISTORICAL"):
+                    msg["content"] = (
+                        "[HISTORICAL — from the start of this session, already addressed]\n"
+                        + content
+                    )
             compressed.append(msg)
 
         # If LLM summary failed, insert a static fallback so the model
