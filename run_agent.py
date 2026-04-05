@@ -6359,8 +6359,12 @@ class AIAgent:
             if messages and messages[-1].get("_flush_sentinel") == _sentinel:
                 messages.pop()
 
-    def _compress_context(self, messages: list, system_message: str, *, approx_tokens: int = None, task_id: str = "default") -> tuple:
+    def _compress_context(self, messages: list, system_message: str, *, approx_tokens: int = None, task_id: str = "default", force_truncation: bool = False) -> tuple:
         """Compress conversation context and split the session in SQLite.
+
+        Args:
+            force_truncation: When True, drop middle turns even if summary
+                generation fails (last-resort fallback for API context overflow).
 
         Returns:
             (compressed_messages, new_system_prompt) tuple
@@ -6381,7 +6385,8 @@ class AIAgent:
             except Exception:
                 pass
 
-        compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens)
+        compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens,
+                                                      force_truncation=force_truncation)
 
         todo_snapshot = self._todo_store.format_for_injection()
         if todo_snapshot:
@@ -8724,6 +8729,7 @@ class AIAgent:
                         messages, active_system_prompt = self._compress_context(
                             messages, system_message, approx_tokens=approx_tokens,
                             task_id=effective_task_id,
+                            force_truncation=True,
                         )
                         # Compression created a new session — clear history
                         # so _flush_messages_to_session_db writes compressed
@@ -8851,9 +8857,13 @@ class AIAgent:
                         self._emit_status(f"🗜️ Context too large (~{approx_tokens:,} tokens) — compressing ({compression_attempts}/{max_compression_attempts})...")
 
                         original_len = len(messages)
+                        # force_truncation=True: API already rejected us for context
+                        # overflow, so dropping turns without summary is better than
+                        # crashing the conversation entirely.
                         messages, active_system_prompt = self._compress_context(
                             messages, system_message, approx_tokens=approx_tokens,
                             task_id=effective_task_id,
+                            force_truncation=True,
                         )
                         # Compression created a new session — clear history
                         # so _flush_messages_to_session_db writes compressed
