@@ -6745,7 +6745,15 @@ class HermesCLI:
         _cprint("\n".join(_box_lines))
 
         # Play a notification sound so the user knows a question was asked.
-        # Uses Windows SystemSounds via powershell.exe (works from WSL).
+        # 1) Terminal bell (\a) — triggers web-chat browser notifications on
+        #    any device (mobile, desktop) via the Web Audio API beep.
+        # 2) Windows SystemSounds via powershell.exe (works from WSL) — richer
+        #    desktop sound for local CLI usage.
+        try:
+            sys.stdout.write("\a")
+            sys.stdout.flush()
+        except Exception:
+            pass
         try:
             import subprocess as _sp
             _sp.Popen(
@@ -6821,6 +6829,22 @@ class HermesCLI:
         }
         self._sudo_deadline = _time.monotonic() + timeout
 
+        # Play notification sound for sudo prompt (bell + Windows sound)
+        try:
+            sys.stdout.write("\a")
+            sys.stdout.flush()
+        except Exception:
+            pass
+        try:
+            import subprocess as _sp
+            _sp.Popen(
+                ["powershell.exe", "-NoProfile", "-Command",
+                 "[System.Media.SystemSounds]::Hand.Play()"],
+                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+            )
+        except Exception:
+            pass
+
         self._invalidate()
 
         while True:
@@ -6877,6 +6901,22 @@ class HermesCLI:
                 "response_queue": response_queue,
             }
             self._approval_deadline = _time.monotonic() + timeout
+
+            # Play notification sound for approval prompt (bell + Windows sound)
+            try:
+                sys.stdout.write("\a")
+                sys.stdout.flush()
+            except Exception:
+                pass
+            try:
+                import subprocess as _sp
+                _sp.Popen(
+                    ["powershell.exe", "-NoProfile", "-Command",
+                     "[System.Media.SystemSounds]::Question.Play()"],
+                    stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+                )
+            except Exception:
+                pass
 
             self._invalidate()
 
@@ -7886,6 +7926,17 @@ class HermesCLI:
             # --- Clarify choice mode: confirm the highlighted selection ---
             if self._clarify_state and not self._clarify_freetext:
                 state = self._clarify_state
+                # If the user typed text in the input buffer, treat it as
+                # an "Other" freetext response — don't accidentally submit
+                # the highlighted choice when they intended to type their own answer.
+                typed_text = event.app.current_buffer.text.strip()
+                if typed_text:
+                    state["response_queue"].put(typed_text)
+                    self._clarify_state = None
+                    self._clarify_freetext = False
+                    event.app.current_buffer.reset()
+                    event.app.invalidate()
+                    return
                 selected = state["selected"]
                 choices = state.get("choices") or []
                 if selected < len(choices):
