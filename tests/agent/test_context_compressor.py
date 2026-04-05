@@ -742,3 +742,158 @@ class TestTokenBudgetTailProtection:
         # Tool at index 2 is outside the protected tail (last 3 = indices 2,3,4)
         # so it might or might not be pruned depending on boundary
         assert isinstance(pruned, int)
+
+class TestHistoricalPrefix:
+    """Verify that preserved head user/assistant messages are marked [HISTORICAL]."""
+
+    def test_head_user_message_gets_historical_prefix(self):
+        """When protect_first_n > 1, preserved user messages should get [HISTORICAL] prefix."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "summary text"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=3,
+                protect_last_n=2,
+            )
+
+        msgs = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Build me a website"},
+            {"role": "assistant", "content": "Sure, I'll help you build a website."},
+            {"role": "user", "content": "middle msg 1"},
+            {"role": "assistant", "content": "middle msg 2"},
+            {"role": "user", "content": "middle msg 3"},
+            {"role": "assistant", "content": "middle msg 4"},
+            {"role": "user", "content": "recent user msg"},
+            {"role": "assistant", "content": "recent assistant msg"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            result = c.compress(msgs)
+
+        # System prompt should NOT have HISTORICAL prefix
+        system_msg = result[0]
+        assert system_msg["role"] == "system"
+        assert not system_msg["content"].startswith("[HISTORICAL")
+
+        # Find preserved head user/assistant messages (index 1 and 2)
+        head_user = result[1]
+        head_assistant = result[2]
+        assert head_user["role"] == "user"
+        assert head_user["content"].startswith("[HISTORICAL")
+        assert "Build me a website" in head_user["content"]
+        assert head_assistant["role"] == "assistant"
+        assert head_assistant["content"].startswith("[HISTORICAL")
+        assert "help you build a website" in head_assistant["content"]
+
+    def test_historical_prefix_idempotent(self):
+        """Re-compressing should not double-prefix HISTORICAL messages."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "summary text"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=3,
+                protect_last_n=2,
+            )
+
+        msgs = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "[HISTORICAL — from the start of this session, already addressed]\nBuild me a website"},
+            {"role": "assistant", "content": "[HISTORICAL — from the start of this session, already addressed]\nSure thing."},
+            {"role": "user", "content": "middle 1"},
+            {"role": "assistant", "content": "middle 2"},
+            {"role": "user", "content": "middle 3"},
+            {"role": "assistant", "content": "middle 4"},
+            {"role": "user", "content": "recent 1"},
+            {"role": "assistant", "content": "recent 2"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            result = c.compress(msgs)
+
+        head_user = result[1]
+        # Should not have double prefix
+        assert head_user["content"].count("[HISTORICAL") == 1
+
+    def test_no_historical_prefix_with_protect_first_1(self):
+        """With protect_first_n=1 (default), no user/assistant messages are in head, so no prefix needed."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "summary text"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=1,
+                protect_last_n=2,
+            )
+
+        msgs = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Build me a website"},
+            {"role": "assistant", "content": "Sure thing."},
+            {"role": "user", "content": "middle 1"},
+            {"role": "assistant", "content": "middle 2"},
+            {"role": "user", "content": "recent 1"},
+            {"role": "assistant", "content": "recent 2"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            result = c.compress(msgs)
+
+        # Only system prompt in head — no user/assistant messages to prefix
+        assert result[0]["role"] == "system"
+        # No message should have HISTORICAL prefix
+        for msg in result:
+            content = msg.get("content") or ""
+            if msg["role"] != "system":
+                # Tail messages should NOT have HISTORICAL prefix
+                if not content.startswith("[CONTEXT COMPACTION]"):
+                    assert not content.startswith("[HISTORICAL")
+
+    def test_tool_call_messages_not_prefixed(self):
+        """Assistant messages with tool_calls should NOT get HISTORICAL prefix."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "summary text"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=4,
+                protect_last_n=2,
+            )
+
+        msgs = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": "Search for files"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "search", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+            {"role": "user", "content": "middle 1"},
+            {"role": "assistant", "content": "middle 2"},
+            {"role": "user", "content": "middle 3"},
+            {"role": "assistant", "content": "middle 4"},
+            {"role": "user", "content": "recent 1"},
+            {"role": "assistant", "content": "recent 2"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            result = c.compress(msgs)
+
+        # The assistant message with tool_calls should NOT have HISTORICAL prefix
+        for msg in result:
+            if msg.get("tool_calls"):
+                content = msg.get("content") or ""
+                assert not content.startswith("[HISTORICAL")
