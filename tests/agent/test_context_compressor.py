@@ -64,21 +64,36 @@ class TestCompress:
         result = compressor.compress(msgs)
         assert result == msgs
 
-    def test_truncation_fallback_no_client(self, compressor):
-        # compressor has client=None, so should use truncation fallback
+    def test_abort_when_no_client(self, compressor):
+        # compressor has client=None, so _generate_summary returns None.
+        # With abort-on-failure semantics, compress() must return original
+        # messages unchanged to prevent silent data loss.
         msgs = [{"role": "system", "content": "System prompt"}] + self._make_messages(10)
         result = compressor.compress(msgs)
-        assert len(result) < len(msgs)
-        # Should keep system message and last N
+        assert len(result) == len(msgs)
         assert result[0]["role"] == "system"
-        assert compressor.compression_count == 1
+        assert compressor.compression_count == 0
 
-    def test_compression_increments_count(self, compressor):
+    def test_compression_increments_count(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "summary text"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+            )
+
         msgs = self._make_messages(10)
-        compressor.compress(msgs)
-        assert compressor.compression_count == 1
-        compressor.compress(msgs)
-        assert compressor.compression_count == 2
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            c.compress(msgs)
+        assert c.compression_count == 1
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            c.compress(msgs)
+        assert c.compression_count == 2
 
     def test_protects_first_and_last(self, compressor):
         msgs = self._make_messages(10)
@@ -120,7 +135,8 @@ class TestGenerateSummaryNoneContent:
         assert summary.startswith(SUMMARY_PREFIX)
 
     def test_none_content_in_system_message_compress(self):
-        """System message with content=None should not crash during compress."""
+        """System message with content=None should not crash during compress.
+        With no summary client, compress() aborts and returns messages unchanged."""
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
 
@@ -129,7 +145,8 @@ class TestGenerateSummaryNoneContent:
             for i in range(10)
         ]
         result = c.compress(msgs)
-        assert len(result) < len(msgs)
+        # With abort-on-failure, original messages are returned unchanged
+        assert len(result) == len(msgs)
 
 
 class TestNonStringContent:
@@ -897,3 +914,43 @@ class TestHistoricalPrefix:
             if msg.get("tool_calls"):
                 content = msg.get("content") or ""
                 assert not content.startswith("[HISTORICAL")
+
+    def test_non_string_content_not_prefixed(self):
+        """Messages with non-string content (e.g. OpenAI vision list) must not crash."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "summary text"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100_000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=3,
+                protect_last_n=2,
+            )
+
+        msgs = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            # Vision-style message with list content
+            {"role": "user", "content": [
+                {"type": "text", "text": "What's in this image?"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/img.png"}},
+            ]},
+            {"role": "assistant", "content": "I see a cat."},
+            {"role": "user", "content": "middle 1"},
+            {"role": "assistant", "content": "middle 2"},
+            {"role": "user", "content": "middle 3"},
+            {"role": "assistant", "content": "middle 4"},
+            {"role": "user", "content": "recent"},
+            {"role": "assistant", "content": "recent reply"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response):
+            result = c.compress(msgs)
+
+        # Should not crash.  The list-content message should survive unchanged.
+        list_msg = result[1]
+        assert isinstance(list_msg["content"], list)
+        assert not isinstance(list_msg["content"], str)
+        # The assistant message with string content SHOULD get the prefix
+        assert result[2]["content"].startswith("[HISTORICAL")
