@@ -1568,6 +1568,10 @@ class HermesCLI:
         self.resume_display = CLI_CONFIG["display"].get("resume_display", "full")
         # bell_on_complete: play terminal bell (\a) when agent finishes a response
         self.bell_on_complete = CLI_CONFIG["display"].get("bell_on_complete", False)
+        # bell_on_prompt: play terminal bell (\a) when the agent needs user input
+        # (clarify questions, sudo prompts, approval requests). Useful for
+        # getting attention over SSH, in multiplexers, or via web terminals.
+        self.bell_on_prompt = CLI_CONFIG["display"].get("bell_on_prompt", True)
         # show_reasoning: display model thinking/reasoning before the response
         self.show_reasoning = CLI_CONFIG["display"].get("show_reasoning", False)
         # busy_input_mode: "interrupt" (Enter interrupts current run) or "queue" (Enter queues for next turn)
@@ -6767,6 +6771,15 @@ class HermesCLI:
         # Trigger prompt_toolkit repaint from this (non-main) thread
         self._invalidate()
 
+        # Play terminal bell to alert the user that input is needed.
+        # Propagates over SSH, tmux, screen, and web terminals.
+        if self.bell_on_prompt:
+            try:
+                sys.stdout.write("\a")
+                sys.stdout.flush()
+            except Exception:
+                pass
+
         # Poll for the user's response.  The countdown in the hint line
         # updates on each invalidate — but frequent repaints cause visible
         # flicker in some terminals (Kitty, ghostty).  We only refresh the
@@ -6847,6 +6860,14 @@ class HermesCLI:
 
         self._invalidate()
 
+        # Play terminal bell to alert the user that sudo password is needed.
+        if self.bell_on_prompt:
+            try:
+                sys.stdout.write("\a")
+                sys.stdout.flush()
+            except Exception:
+                pass
+
         while True:
             try:
                 result = response_queue.get(timeout=1)
@@ -6919,6 +6940,14 @@ class HermesCLI:
                 pass
 
             self._invalidate()
+
+            # Play terminal bell to alert the user that command approval is needed.
+            if self.bell_on_prompt:
+                try:
+                    sys.stdout.write("\a")
+                    sys.stdout.flush()
+                except Exception:
+                    pass
 
             _last_countdown_refresh = _time.monotonic()
             while True:
