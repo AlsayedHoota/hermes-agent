@@ -6773,7 +6773,7 @@ class HermesCLI:
 
         # Play terminal bell to alert the user that input is needed.
         # Propagates over SSH, tmux, screen, and web terminals.
-        if self.bell_on_prompt:
+        if getattr(self, "bell_on_prompt", True):
             try:
                 sys.stdout.write("\a")
                 sys.stdout.flush()
@@ -6861,7 +6861,7 @@ class HermesCLI:
         self._invalidate()
 
         # Play terminal bell to alert the user that sudo password is needed.
-        if self.bell_on_prompt:
+        if getattr(self, "bell_on_prompt", True):
             try:
                 sys.stdout.write("\a")
                 sys.stdout.flush()
@@ -6942,7 +6942,7 @@ class HermesCLI:
             self._invalidate()
 
             # Play terminal bell to alert the user that command approval is needed.
-            if self.bell_on_prompt:
+            if getattr(self, "bell_on_prompt", True):
                 try:
                     sys.stdout.write("\a")
                     sys.stdout.flush()
