@@ -1992,7 +1992,7 @@ class HermesCLI:
             if width < 52:
                 text = f"⚕ {snapshot['model_short']} · {duration_label}"
                 return self._trim_status_bar_text(text, width)
-            if width < 76:
+            if width < 69:
                 parts = [f"⚕ {snapshot['model_short']}", percent_label]
                 parts.append(duration_label)
                 return self._trim_status_bar_text(" · ".join(parts), width)
@@ -2034,7 +2034,7 @@ class HermesCLI:
             else:
                 percent = snapshot["context_percent"]
                 percent_label = f"{percent}%" if percent is not None else "--"
-                if width < 76:
+                if width < 69:
                     frags = [
                         ("class:status-bar", " ⚕ "),
                         ("class:status-bar-strong", snapshot["model_short"]),
