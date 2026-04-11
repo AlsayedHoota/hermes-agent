@@ -58,3 +58,4 @@ mini-swe-agent/
 # Nix
 .direnv/
 result
+delegation_api_mode_e2e_test.py

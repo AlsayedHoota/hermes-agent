@@ -17,7 +17,7 @@ from typing import Any, Optional
 COPILOT_BASE_URL = "https://api.githubcopilot.com"
 COPILOT_MODELS_URL = f"{COPILOT_BASE_URL}/models"
 COPILOT_EDITOR_VERSION = "vscode/1.104.1"
-COPILOT_REASONING_EFFORTS_GPT5 = ["minimal", "low", "medium", "high"]
+COPILOT_REASONING_EFFORTS_GPT5 = ["minimal", "low", "medium", "high", "xhigh"]
 COPILOT_REASONING_EFFORTS_O_SERIES = ["low", "medium", "high"]
 
 
