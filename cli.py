@@ -1793,6 +1793,16 @@ class HermesCLI:
 
         # Status bar visibility (toggled via /statusbar)
         self._status_bar_visible = True
+        # Whether the user explicitly wants the status bar visible.
+        # Streaming suppression hides the bar temporarily but restores to
+        # this value when all streaming contexts exit.
+        self._status_bar_user_pref = True
+        # Suppression depth counter — when > 0 the status bar is hidden.
+        # Used by streaming contexts (reasoning box, response stream box) to
+        # prevent prompt_toolkit bottom-bar redraws from leaking as inline text
+        # through tmux -> PTY -> xterm.js.  Nesting-safe: each context calls
+        # _suppress_status_bar() on enter and _restore_status_bar() on exit.
+        self._status_bar_suppress_depth = 0
 
         # Background task tracking: {task_id: threading.Thread}
         self._background_tasks: Dict[str, threading.Thread] = {}
@@ -1805,6 +1815,27 @@ class HermesCLI:
         if hasattr(self, "_app") and self._app and (now - self._last_invalidate) >= min_interval:
             self._last_invalidate = now
             self._app.invalidate()
+
+    def _suppress_status_bar(self) -> None:
+        """Increment the suppression depth and hide the status bar.
+
+        Call this when entering a streaming context (reasoning box, response
+        stream box) to prevent prompt_toolkit bottom-bar redraws from leaking
+        as inline text through tmux -> PTY -> xterm.js.
+        """
+        self._status_bar_suppress_depth += 1
+        self._status_bar_visible = False
+
+    def _restore_status_bar(self) -> None:
+        """Decrement the suppression depth and restore the status bar if zero.
+
+        Only re-shows the bar when all nested streaming contexts have exited,
+        and only if the user hasn't explicitly hidden it via /statusbar.
+        """
+        self._status_bar_suppress_depth = max(0, self._status_bar_suppress_depth - 1)
+        if self._status_bar_suppress_depth == 0:
+            self._status_bar_visible = self._status_bar_user_pref
+            self._invalidate()
 
     def _status_bar_context_style(self, percent_used: Optional[int]) -> str:
         if percent_used is None:
@@ -2315,6 +2346,11 @@ class HermesCLI:
             # _cprint() call, interleaving it with reasoning lines in the
             # PTY output (visible as duplicated thinking faces in web-chat).
             self._spinner_text = ""
+            # Suppress the status bar during reasoning streaming.
+            # Rapid _cprint() calls cause prompt_toolkit to redraw the
+            # bottom bar on every line, and through tmux -> PTY -> xterm.js
+            # these redraws appear as inline text between reasoning lines.
+            self._suppress_status_bar()
             self._invalidate()
             w = shutil.get_terminal_size().columns
             r_label = " Reasoning "
@@ -2343,6 +2379,10 @@ class HermesCLI:
             w = shutil.get_terminal_size().columns
             _cprint(f"{_DIM}└{'─' * (w - 2)}┘{_RST}")
             self._reasoning_box_opened = False
+
+            # Restore the status bar (decrements suppression depth).
+            # Only actually shows the bar when all streaming contexts are done.
+            self._restore_status_bar()
 
             # Flush any content that was deferred while reasoning was rendering.
             deferred = getattr(self, "_deferred_content", "")
@@ -2512,6 +2552,11 @@ class HermesCLI:
             if not text:
                 return
             self._stream_box_opened = True
+            # Suppress the status bar while the response stream box is open.
+            # Rapid _cprint() calls cause prompt_toolkit to redraw the bottom
+            # bar on every line, and through tmux -> PTY -> xterm.js these
+            # redraws appear as inline status bar text between response lines.
+            self._suppress_status_bar()
             try:
                 from hermes_cli.skin_engine import get_active_skin
                 _skin = get_active_skin()
@@ -2593,6 +2638,9 @@ class HermesCLI:
             w = shutil.get_terminal_size().columns
             _cprint(f"{_ACCENT}╰{'─' * (w - 2)}╯{_RST}")
 
+            # Restore the status bar (decrements suppression depth).
+            self._restore_status_bar()
+
     def _reset_stream_state(self) -> None:
         """Reset streaming state before each agent invocation."""
         self._stream_buf = ""
@@ -2606,6 +2654,11 @@ class HermesCLI:
         self._reasoning_buf = ""
         self._reasoning_preview_buf = ""
         self._deferred_content = ""
+        # Safety net: force-reset suppression depth and restore the status bar
+        # if any streaming context was left open (e.g. interrupted, exception).
+        if self._status_bar_suppress_depth > 0:
+            self._status_bar_suppress_depth = 0
+            self._status_bar_visible = self._status_bar_user_pref
 
     def _slow_command_status(self, command: str) -> str:
         """Return a user-facing status message for slower slash commands."""
@@ -5054,7 +5107,8 @@ class HermesCLI:
         elif canonical == "status":
             self._show_session_status()
         elif canonical == "statusbar":
-            self._status_bar_visible = not self._status_bar_visible
+            self._status_bar_user_pref = not self._status_bar_user_pref
+            self._status_bar_visible = self._status_bar_user_pref
             state = "visible" if self._status_bar_visible else "hidden"
             self.console.print(f"  Status bar {state}")
         elif canonical == "verbose":
