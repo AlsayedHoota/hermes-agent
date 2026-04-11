@@ -48,6 +48,11 @@ def _make_cli_stub():
     cli._stream_text_ansi = ""
     cli._stream_needs_break = False
 
+    # Status bar state (needed by _suppress/_restore_status_bar)
+    cli._status_bar_visible = True
+    cli._status_bar_user_pref = True
+    cli._status_bar_suppress_depth = 0
+
     # Capture _cprint output instead of printing to terminal
     cli._cprinted = []
 
