@@ -93,7 +93,7 @@ class ContextCompressor(ContextEngine):
         self,
         model: str,
         threshold_percent: float = 0.50,
-        protect_first_n: int = 3,
+        protect_first_n: int = 1,
         protect_last_n: int = 20,
         summary_target_ratio: float = 0.20,
         quiet_mode: bool = False,
@@ -329,8 +329,13 @@ NEW TURNS TO INCORPORATE:
 
 Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new progress. Move items from "In Progress" to "Done" when completed. Remove information only if it is clearly obsolete.
 
+CRITICAL: The "Current Focus" section is the MOST IMPORTANT part — it determines what the assistant works on next. Derive it strictly from the MOST RECENT turns, not from the original goal. If the conversation has moved on from the original topic, the current focus MUST reflect that shift.
+
+## Current Focus
+[What is being actively worked on RIGHT NOW based on the most recent messages. This is NOT the original goal — it is what the conversation was doing when compaction fired. The next assistant will use this to decide what to do next.]
+
 ## Goal
-[What the user is trying to accomplish — preserve from previous summary, update if goal evolved]
+[The user's core objective for this session — preserve from previous summary, update if goal evolved]
 
 ## Constraints & Preferences
 [User preferences, coding style, constraints, important decisions — accumulate across compactions]
@@ -368,10 +373,15 @@ Write only the summary body. Do not include any preamble or prefix."""
 TURNS TO SUMMARIZE:
 {content_to_summarize}
 
+CRITICAL: The "Current Focus" section is the MOST IMPORTANT part — it determines what the assistant works on next. Derive it strictly from the MOST RECENT turns in the conversation, not from the earliest messages. If the conversation evolved from one topic to another, the current focus must reflect where the conversation ended up, NOT where it started.
+
 Use this exact structure:
 
+## Current Focus
+[What is being actively worked on RIGHT NOW based on the most recent messages. This is NOT the original goal — it is what the conversation was doing when compaction fired. The next assistant will use this to decide what to do next.]
+
 ## Goal
-[What the user is trying to accomplish]
+[What the user is trying to accomplish — the overarching objective]
 
 ## Constraints & Preferences
 [User preferences, coding style, constraints, important decisions]

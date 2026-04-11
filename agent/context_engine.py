@@ -57,7 +57,7 @@ class ContextEngine(ABC):
     # engines.
 
     threshold_percent: float = 0.75
-    protect_first_n: int = 3
+    protect_first_n: int = 1
     protect_last_n: int = 6
 
     # -- Core interface ----------------------------------------------------

@@ -1314,7 +1314,7 @@ class AIAgent:
             self.context_compressor = ContextCompressor(
                 model=self.model,
                 threshold_percent=compression_threshold,
-                protect_first_n=3,
+                protect_first_n=1,
                 protect_last_n=compression_protect_last,
                 summary_target_ratio=compression_target_ratio,
                 summary_model_override=compression_summary_model,
