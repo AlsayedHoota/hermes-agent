@@ -6838,7 +6838,7 @@ class HermesCLI:
                 if len(question) > 80 or '\n' in question:
                     _q_short += "..."
                 _cprint(f"  {_DIM}Q: {_q_short}{_RST}")
-                _cprint(f"  {_GOLD}A: {result}{_RST}\n")
+                _cprint(f"  {_q_color}A: {result}{_RST}\n")
                 return result
             except queue.Empty:
                 remaining = self._clarify_deadline - _time.monotonic()
