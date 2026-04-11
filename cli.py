@@ -2183,6 +2183,12 @@ class HermesCLI:
         """Called by agent when thinking starts/stops. Updates TUI spinner."""
         if not text:
             self._flush_reasoning_preview(force=True)
+        # Suppress spinner updates while the reasoning box is open -- the
+        # reasoning box itself is the visible thinking indicator.  Without
+        # this guard, _on_thinking keeps re-setting _spinner_text and the
+        # prompt_toolkit redraw interleaves it with reasoning lines.
+        if getattr(self, "_reasoning_box_opened", False) and text:
+            return
         self._spinner_text = text or ""
         self._tool_start_time = 0.0  # clear tool timer when switching to thinking
         self._invalidate()
@@ -2304,6 +2310,12 @@ class HermesCLI:
         # Open reasoning box on first reasoning token
         if not getattr(self, "_reasoning_box_opened", False):
             self._reasoning_box_opened = True
+            # Suppress the spinner widget while the reasoning box is open.
+            # Otherwise prompt_toolkit redraws the spinner text on every
+            # _cprint() call, interleaving it with reasoning lines in the
+            # PTY output (visible as duplicated thinking faces in web-chat).
+            self._spinner_text = ""
+            self._invalidate()
             w = shutil.get_terminal_size().columns
             r_label = " Reasoning "
             r_fill = w - 2 - len(r_label)
