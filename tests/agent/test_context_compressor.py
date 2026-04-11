@@ -64,15 +64,19 @@ class TestCompress:
         result = compressor.compress(msgs)
         assert result == msgs
 
-    def test_abort_when_no_client(self, compressor):
+    def test_static_fallback_when_no_client(self, compressor):
         # compressor has client=None, so _generate_summary returns None.
-        # With abort-on-failure semantics, compress() must return original
-        # messages unchanged to prevent silent data loss.
+        # Upstream behavior: insert a static fallback summary instead of aborting,
+        # so the model knows context was lost rather than silently dropping everything.
         msgs = [{"role": "system", "content": "System prompt"}] + self._make_messages(10)
         result = compressor.compress(msgs)
-        assert len(result) == len(msgs)
+        # Should have compressed (fewer messages) with a static fallback summary
+        assert len(result) < len(msgs)
         assert result[0]["role"] == "system"
-        assert compressor.compression_count == 0
+        # Should contain a fallback summary mentioning unavailable generation
+        summary_texts = [m.get("content", "") for m in result if "unavailable" in (m.get("content") or "")]
+        assert len(summary_texts) >= 1, "Expected static fallback summary"
+        assert compressor.compression_count == 1
 
     def test_compression_increments_count(self):
         mock_response = MagicMock()
@@ -136,7 +140,7 @@ class TestGenerateSummaryNoneContent:
 
     def test_none_content_in_system_message_compress(self):
         """System message with content=None should not crash during compress.
-        With no summary client, compress() aborts and returns messages unchanged."""
+        With static fallback, compress() still compresses with a fallback summary."""
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
             c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
 
@@ -145,8 +149,8 @@ class TestGenerateSummaryNoneContent:
             for i in range(10)
         ]
         result = c.compress(msgs)
-        # With abort-on-failure, original messages are returned unchanged
-        assert len(result) == len(msgs)
+        # With static fallback, should compress (fewer messages) without crashing
+        assert len(result) < len(msgs)
 
 
 class TestNonStringContent:

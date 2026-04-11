@@ -706,7 +706,7 @@ Write only the summary body. Do not include any preamble or prefix."""
                 # Without this, the model may treat the first user message
                 # as a new/pending request and deviate from current work.
                 content = msg.get("content") or ""
-                if content and not content.startswith("[HISTORICAL"):
+                if isinstance(content, str) and content and not content.startswith("[HISTORICAL"):
                     msg["content"] = (
                         "[HISTORICAL — from the start of this session, already addressed]\n"
                         + content
