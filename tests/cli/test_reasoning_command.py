@@ -717,6 +717,14 @@ class TestReasoningShownThisTurnFlag(unittest.TestCase):
         cli._stream_prefilt = ""
         cli._in_reasoning_block = False
         cli._reasoning_preview_buf = ""
+        cli._deferred_content = ""
+        cli._stream_needs_break = False
+        cli._spinner_text = ""
+        cli._tool_start_time = 0.0
+        cli._status_bar_visible = True
+        cli._status_bar_user_pref = True
+        cli._status_bar_suppress_depth = 0
+        cli._invalidate = lambda *args, **kwargs: None
         return cli
 
     @patch("cli._cprint")

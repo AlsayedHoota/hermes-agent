@@ -16,6 +16,8 @@ def _make_cli():
     cli_obj.session_id = "session-123"
     cli_obj._pending_input = MagicMock()
     cli_obj._status_bar_visible = True
+    cli_obj._status_bar_user_pref = True
+    cli_obj._status_bar_suppress_depth = 0
     cli_obj.model = "openai/gpt-5.4"
     cli_obj.provider = "openai"
     cli_obj.session_start = datetime(2026, 4, 9, 19, 24)

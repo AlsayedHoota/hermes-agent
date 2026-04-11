@@ -26,6 +26,12 @@ def _make_cli_stub():
     cli._stream_needs_break = False
     cli._emitted = []
 
+    # Status bar state (needed by _suppress/_restore_status_bar)
+    cli._status_bar_visible = True
+    cli._status_bar_user_pref = True
+    cli._status_bar_suppress_depth = 0
+    cli._invalidate = lambda: None
+
     # Mock _emit_stream_text to capture output
     def mock_emit(text):
         cli._emitted.append(text)
