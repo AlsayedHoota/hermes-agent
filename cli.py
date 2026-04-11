@@ -2654,11 +2654,17 @@ class HermesCLI:
         self._reasoning_buf = ""
         self._reasoning_preview_buf = ""
         self._deferred_content = ""
-        # Safety net: force-reset suppression depth and restore the status bar
-        # if any streaming context was left open (e.g. interrupted, exception).
-        if self._status_bar_suppress_depth > 0:
-            self._status_bar_suppress_depth = 0
-            self._status_bar_visible = self._status_bar_user_pref
+        # Safety net: reset per-box suppression layers (reasoning, response)
+        # but preserve the turn-level suppression layer (depth=1) added by
+        # the agent turn wrapper.  Without this guard, mid-turn resets
+        # (e.g. _stream_delta(None) between tool calls) would nuke the
+        # turn-level suppression and re-enable the status bar, causing
+        # prompt_toolkit bottom-bar redraws to leak as inline text through
+        # the PTY -> xterm.js pipe in web-chat/mobile.
+        # The turn-level layer is restored in the `finally` block of the
+        # agent turn method; we only clip per-box layers here.
+        if self._status_bar_suppress_depth > 1:
+            self._status_bar_suppress_depth = 1
 
     def _slow_command_status(self, command: str) -> str:
         """Return a user-facing status message for slower slash commands."""
@@ -7329,6 +7335,15 @@ class HermesCLI:
 
             # Reset streaming display state for this turn
             self._reset_stream_state()
+            # Suppress the status bar for the ENTIRE agent turn.
+            # Without this, _cprint() calls between streaming boxes (tool
+            # progress, tool-gen-start, separators, etc.) trigger
+            # prompt_toolkit bottom-bar redraws that render as inline text
+            # through the PTY -> xterm.js pipe in web-chat/mobile.
+            # The per-box suppress/restore calls (reasoning, response stream)
+            # still nest correctly (depth goes 1->2->1 instead of 0->1->0).
+            # Restored in the `finally` block at the end of this turn.
+            self._suppress_status_bar()
             # Separate from _reset_stream_state because this must persist
             # across intermediate turn boundaries (tool-calling loops) — only
             # reset at the start of each user turn.
@@ -7656,6 +7671,10 @@ class HermesCLI:
             print(f"Error: {e}")
             return None
         finally:
+            # Restore the status bar after the agent turn completes.
+            # Matches the _suppress_status_bar() at the top of this block.
+            # Must be in `finally` so it fires even on exceptions/interrupts.
+            self._restore_status_bar()
             # Ensure streaming TTS resources are cleaned up even on error.
             # Normal path sends the sentinel at line ~3568; this is a safety
             # net for exception paths that skip it.  Duplicate sentinels are
