@@ -1281,7 +1281,21 @@ class AIAgent:
         except Exception:
             pass
 
-        if _engine_name != "compressor":
+        if _engine_name == "truncator":
+            # Built-in truncation-only engine (no LLM summarization)
+            from agent.context_truncator import ContextTruncator
+            _selected_engine = ContextTruncator(
+                model=self.model,
+                threshold_percent=compression_threshold,
+                target_percent=compression_target_ratio,
+                protect_last_n=compression_protect_last,
+                quiet_mode=self.quiet_mode,
+                base_url=self.base_url,
+                api_key=getattr(self, "api_key", ""),
+                config_context_length=_config_context_length,
+                provider=self.provider,
+            )
+        elif _engine_name != "compressor":
             # Try loading from plugins/context_engine/<name>/
             try:
                 from plugins.context_engine import load_context_engine
