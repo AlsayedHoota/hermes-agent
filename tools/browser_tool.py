@@ -379,8 +379,53 @@ def _socket_safe_tmpdir() -> str:
 
 # Track active sessions per task
 # Stores: session_name (always), bb_session_id + cdp_url (cloud mode only)
+# CDP sessions also store: cdp_tab_id (str) — DevTools target ID for tab isolation
 _active_sessions: Dict[str, Dict[str, str]] = {}  # task_id -> {session_name, ...}
 _recording_sessions: set = set()  # task_ids with active recordings
+
+# =============================================================================
+# CDP Tab Isolation
+# =============================================================================
+# When using a shared Chrome via CDP, all tasks share a single agent-browser
+# daemon (single socket dir) to maintain consistent tab state.  Each task gets
+# its own tab via ``tab new`` on first use, and every command is preceded by
+# ``tab <index>`` to switch to the right tab.  This prevents concurrent agents
+# from hijacking each other's pages.
+#
+# CROSS-PROCESS SAFETY: We use a file-based lock (filelock.FileLock) instead
+# of threading.Lock so that separate agent processes (Hermes, Nova, Forge, etc.)
+# sharing the same Chrome via CDP cannot interleave tab-switch + command pairs.
+# The lock file lives in the shared socket dir alongside the agent-browser daemon.
+_cdp_shared_socket_dir: Optional[str] = None  # shared by all CDP sessions in this process
+_cdp_tab_lock: Optional["filelock.FileLock"] = None  # cross-process lock; lazy-init in _get_cdp_tab_lock()
+_cdp_tab_lock_inproc = threading.Lock()  # guards lazy init of _cdp_tab_lock
+
+
+def _get_cdp_tab_lock() -> "filelock.FileLock":
+    """Return (and lazily create) the cross-process file lock for CDP tab ops.
+
+    The lock file is placed in the shared socket dir so all processes
+    connecting to the same Chrome instance serialise their tab switches.
+    Falls back to an in-memory threading lock if filelock is unavailable
+    (shouldn't happen — filelock is a dependency).
+    """
+    global _cdp_tab_lock
+    if _cdp_tab_lock is not None:
+        return _cdp_tab_lock
+    with _cdp_tab_lock_inproc:
+        if _cdp_tab_lock is not None:
+            return _cdp_tab_lock
+        try:
+            import filelock
+            lock_dir = _get_cdp_shared_socket_dir()
+            lock_path = os.path.join(lock_dir, ".cdp_tab.lock")
+            _cdp_tab_lock = filelock.FileLock(lock_path, timeout=30)
+            logger.info("CDP cross-process tab lock: %s", lock_path)
+        except ImportError:
+            logger.warning("filelock not installed; CDP tab lock is in-process only")
+            # Shim: wrap threading.Lock to match FileLock API (acquire/release + context manager)
+            _cdp_tab_lock = threading.Lock()  # type: ignore[assignment]
+        return _cdp_tab_lock
 
 # Flag to track if cleanup has been done
 _cleanup_done = False
@@ -661,7 +706,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_console",
-        "description": "Get browser console output and JavaScript errors from the current page. Returns console.log/warn/error/info messages and uncaught JS exceptions. Use this to detect silent JavaScript errors, failed API calls, and application warnings. Requires browser_navigate to be called first. When 'expression' is provided, evaluates JavaScript in the page context and returns the result — use this for DOM inspection, reading page state, or extracting data programmatically.",
+        "description": "Get browser console output and JavaScript errors from the current page. Returns console.log/warn/error/info messages and uncaught JS exceptions. Use this to detect silent JavaScript errors, failed API calls, and application warnings. Requires browser_navigate to be called first. When 'expression' is provided, evaluates JavaScript in the page context and returns the result — use this for DOM inspection, reading page state, or extracting data programmatically. EFFICIENCY TIP: Use expression to extract full page content in ONE call instead of repeated browser_scroll + browser_snapshot loops. Examples: extract all article text with document.querySelector('main').innerText, get all links with Array.from(document.querySelectorAll('a')).map(a=>({href:a.href,text:a.innerText})), read page metadata, check element visibility, or run any Chrome DevTools operation. This is equivalent to the Chrome DevTools console — anything you can do there, you can do here.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -672,7 +717,7 @@ BROWSER_TOOL_SCHEMAS = [
                 },
                 "expression": {
                     "type": "string",
-                    "description": "JavaScript expression to evaluate in the page context. Runs in the browser like DevTools console — full access to DOM, window, document. Return values are serialized to JSON. Example: 'document.title' or 'document.querySelectorAll(\"a\").length'"
+                    "description": "JavaScript expression to evaluate in the page context. Runs in the browser like DevTools console — full access to DOM, window, document, fetch, localStorage, sessionStorage, and all Web APIs. Return values are serialized to JSON. Examples: 'document.title', 'document.querySelectorAll(\"a\").length', full article extraction: '(() => { const el = document.querySelector(\"main\") || document.querySelector(\"article\"); return el ? el.innerText.substring(0, 8000) : \"No article found\"; })()', structured data: 'Array.from(document.querySelectorAll(\"h2, h3\")).map(h => h.innerText)'. Prefer this over repeated browser_scroll + browser_snapshot when you need to read content."
                 }
             },
             "required": []
@@ -698,16 +743,261 @@ def _create_local_session(task_id: str) -> Dict[str, str]:
     }
 
 
+def _get_cdp_shared_socket_dir() -> str:
+    """Return (and lazily create) the shared socket directory for CDP sessions.
+
+    All CDP tasks share one agent-browser daemon so that ``tab <N>`` state
+    persists between sequential commands issued by *different* tasks running
+    in the same process.
+    """
+    global _cdp_shared_socket_dir
+    if _cdp_shared_socket_dir is None:
+        _cdp_shared_socket_dir = os.path.join(
+            _socket_safe_tmpdir(), "agent-browser-cdp-shared"
+        )
+        os.makedirs(_cdp_shared_socket_dir, mode=0o700, exist_ok=True)
+        logger.info("CDP shared socket dir: %s", _cdp_shared_socket_dir)
+    return _cdp_shared_socket_dir
+
+
+def _cdp_host_port(cdp_url: str) -> Optional[str]:
+    """Extract ``host:port`` from a CDP/WS/HTTP URL."""
+    import re as _re
+    m = _re.search(r"://([^/]+)", cdp_url)
+    return m.group(1) if m else None
+
+
+def _cdp_create_tab(cdp_url: str) -> str:
+    """Create a new browser tab and return its **DevTools target ID**.
+
+    The target ID is a stable, unique identifier for the tab that does not
+    change when the ``/json/list`` ordering shifts (which happens whenever
+    Chrome reshuffles its tab list, e.g. on navigation or focus changes).
+
+    We always use the HTTP DevTools API (``/json/new``) because it directly
+    returns the target ID without extra enumeration.
+    """
+    host_port = _cdp_host_port(cdp_url)
+    if not host_port:
+        raise RuntimeError(f"Cannot extract host:port from CDP URL: {cdp_url}")
+
+    try:
+        import uuid as _uuid
+        sentinel = f"hermes-tab-{_uuid.uuid4().hex[:10]}"
+        resp = requests.put(f"http://{host_port}/json/new?data:text/html,{sentinel}", timeout=10)
+        resp.raise_for_status()
+        target_id = resp.json().get("id", "")
+        if target_id:
+            logger.info("CDP tab created via /json/new -> target_id=%s", target_id)
+            return target_id
+    except Exception as exc:
+        logger.warning("HTTP /json/new failed: %s", exc)
+
+    # Fallback: try agent-browser tab new, then extract target_id from /json/list
+    try:
+        browser_cmd = _find_agent_browser()
+    except FileNotFoundError:
+        raise RuntimeError("agent-browser not found; cannot create CDP tab")
+
+    cmd_prefix = (
+        ["npx", "agent-browser"]
+        if browser_cmd == "npx agent-browser"
+        else [browser_cmd]
+    )
+    shared_dir = _get_cdp_shared_socket_dir()
+
+    env = {**os.environ}
+    hermes_home = get_hermes_home()
+    hermes_node_bin = str(hermes_home / "node" / "bin")
+    existing_path = env.get("PATH", "")
+    path_parts = [p for p in existing_path.split(":") if p]
+    candidate_dirs = (
+        [hermes_node_bin]
+        + list(_discover_homebrew_node_dirs())
+        + [p for p in _SANE_PATH.split(":") if p]
+    )
+    for part in reversed(candidate_dirs):
+        if os.path.isdir(part) and part not in path_parts:
+            path_parts.insert(0, part)
+    env["PATH"] = ":".join(path_parts)
+    env["AGENT_BROWSER_SOCKET_DIR"] = shared_dir
+
+    # Snapshot existing target IDs BEFORE creating new tab
+    pre_ids = set()
+    try:
+        pre_resp = requests.get(f"http://{host_port}/json/list", timeout=5)
+        for t in pre_resp.json():
+            if t.get("type") == "page":
+                pre_ids.add(t.get("id", ""))
+    except Exception:
+        pass
+
+    cmd = cmd_prefix + ["--cdp", cdp_url, "--json", "tab", "new"]
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=15)
+    except Exception as exc:
+        logger.warning("agent-browser tab new failed: %s", exc)
+
+    # Find the newly created tab by diffing target IDs
+    try:
+        post_resp = requests.get(f"http://{host_port}/json/list", timeout=5)
+        for t in post_resp.json():
+            if t.get("type") == "page" and t.get("id", "") not in pre_ids:
+                target_id = t["id"]
+                logger.info("CDP tab created via agent-browser fallback -> target_id=%s", target_id)
+                return target_id
+    except Exception:
+        pass
+
+    raise RuntimeError("Failed to create a new CDP tab for session isolation")
+
+
+def _cdp_resolve_tab_index(cdp_url: str, target_id: str) -> Optional[int]:
+    """Resolve a DevTools target ID to agent-browser's 0-based tab index.
+
+    Chrome's ``/json/list`` and agent-browser maintain **different** tab
+    orderings.  We bridge the two by:
+
+    1. Looking up our tab's current URL (and title) in Chrome's ``/json/list``
+       using the stable *target_id*.
+    2. Running ``agent-browser --json tab list`` to get agent-browser's view.
+    3. Matching by URL (+ title as tiebreaker when URLs collide).
+
+    Returns None if the tab no longer exists.
+    """
+    host_port = _cdp_host_port(cdp_url)
+    if not host_port:
+        return None
+
+    # Step 1: find our tab's URL+title from Chrome's DevTools HTTP API
+    our_url = our_title = None
+    try:
+        resp = requests.get(f"http://{host_port}/json/list", timeout=5)
+        for t in resp.json():
+            if t.get("id") == target_id and t.get("type") == "page":
+                our_url = t.get("url", "")
+                our_title = t.get("title", "")
+                break
+    except Exception as exc:
+        logger.warning("CDP /json/list failed for tab resolve: %s", exc)
+        return None
+
+    if our_url is None:
+        logger.warning("CDP tab %s not found in /json/list (closed?)", target_id)
+        return None
+
+    # Step 2: get agent-browser's tab list
+    try:
+        browser_cmd = _find_agent_browser()
+    except FileNotFoundError:
+        return None
+
+    cmd_prefix = (
+        ["npx", "agent-browser"]
+        if browser_cmd == "npx agent-browser"
+        else [browser_cmd]
+    )
+    shared_dir = _get_cdp_shared_socket_dir()
+
+    env = {**os.environ}
+    hermes_home = get_hermes_home()
+    hermes_node_bin = str(hermes_home / "node" / "bin")
+    existing_path = env.get("PATH", "")
+    path_parts = [p for p in existing_path.split(":") if p]
+    candidate_dirs = (
+        [hermes_node_bin]
+        + list(_discover_homebrew_node_dirs())
+        + [p for p in _SANE_PATH.split(":") if p]
+    )
+    for part in reversed(candidate_dirs):
+        if os.path.isdir(part) and part not in path_parts:
+            path_parts.insert(0, part)
+    env["PATH"] = ":".join(path_parts)
+    env["AGENT_BROWSER_SOCKET_DIR"] = shared_dir
+
+    # Use http://host:port for agent-browser (it may not handle ws:// for tab list)
+    ab_cdp_arg = f"http://{host_port}" if host_port else cdp_url
+    cmd = cmd_prefix + ["--cdp", ab_cdp_arg, "--json", "tab", "list"]
+
+    # Retry with increasing timeout — the first call after a daemon cold-start
+    # can take 15-20s while the node process spins up and connects to Chrome.
+    ab_data = None
+    for attempt, cmd_timeout in enumerate([15, 20], start=1):
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, env=env, timeout=cmd_timeout,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                ab_data = json.loads(result.stdout.strip())
+                break
+            logger.warning(
+                "agent-browser tab list attempt %d failed: rc=%s",
+                attempt, result.returncode,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "agent-browser tab list attempt %d timed out (%ds)",
+                attempt, cmd_timeout,
+            )
+        except Exception as exc:
+            logger.warning("agent-browser tab list attempt %d error: %s", attempt, exc)
+        # Brief pause before retry
+        import time as _time
+        _time.sleep(1)
+
+    if ab_data is None:
+        logger.warning("agent-browser tab list failed after all retries")
+        return None
+
+    ab_tabs = ab_data.get("data", {}).get("tabs", [])
+
+    # Step 3: match by URL.  If multiple tabs share the same URL, use title
+    # as a tiebreaker.  If still ambiguous, take the first match (best-effort).
+    candidates = [t for t in ab_tabs if t.get("url") == our_url]
+    if len(candidates) == 1:
+        idx = candidates[0].get("index")
+        logger.debug("CDP tab %s resolved to ab index %s (URL match)", target_id, idx)
+        return idx
+    if len(candidates) > 1 and our_title:
+        title_match = [t for t in candidates if t.get("title") == our_title]
+        if len(title_match) >= 1:
+            idx = title_match[0].get("index")
+            logger.debug("CDP tab %s resolved to ab index %s (URL+title match)", target_id, idx)
+            return idx
+        # Fall back to first URL match
+        idx = candidates[0].get("index")
+        logger.debug("CDP tab %s resolved to ab index %s (first URL match, ambiguous)", target_id, idx)
+        return idx
+
+    # No URL match — tab may have been navigated by agent-browser already
+    # and the URL hasn't propagated to Chrome yet.  Check if there's an
+    # about:blank or sentinel URL that only we could own.
+    if not candidates:
+        logger.warning("CDP tab %s (url=%s) not found in agent-browser tab list", target_id, our_url[:60])
+    return None
+
+
 def _create_cdp_session(task_id: str, cdp_url: str) -> Dict[str, str]:
-    """Create a session that connects to a user-supplied CDP endpoint."""
+    """Create a session that connects to a user-supplied CDP endpoint.
+
+    Allocates a dedicated browser tab for this task so that concurrent
+    agents using the same shared Chrome do not hijack each other's pages.
+    Stores the tab's DevTools **target ID** (stable across reorderings).
+    """
     import uuid
     session_name = f"cdp_{uuid.uuid4().hex[:10]}"
-    logger.info("Created CDP browser session %s → %s for task %s",
-                session_name, cdp_url, task_id)
+
+    # Create a dedicated tab for this task (serialised to avoid races)
+    with _get_cdp_tab_lock():
+        tab_id = _cdp_create_tab(cdp_url)
+
+    logger.info("Created CDP browser session %s → %s for task %s (tab_id=%s)",
+                session_name, cdp_url, task_id, tab_id)
     return {
         "session_name": session_name,
         "bb_session_id": None,
         "cdp_url": cdp_url,
+        "cdp_tab_id": tab_id,
         "features": {"cdp_override": True},
     }
 
@@ -927,7 +1217,11 @@ def _run_browser_command(
         # Cloud mode — connect to remote Browserbase browser via CDP
         # IMPORTANT: Do NOT use --session with --cdp. In agent-browser >=0.13,
         # --session creates a local browser instance and silently ignores --cdp.
-        backend_args = ["--cdp", session_info["cdp_url"]]
+        # Use http://host:port form, NOT ws:// — agent-browser's ``tab list``
+        # returns empty output with ws:// URLs, causing tab resolution to fail.
+        cdp_hp = _cdp_host_port(session_info["cdp_url"])
+        cdp_arg = f"http://{cdp_hp}" if cdp_hp else session_info["cdp_url"]
+        backend_args = ["--cdp", cdp_arg]
     else:
         # Local mode — launch a headless Chromium instance
         backend_args = ["--session", session_info["session_name"]]
@@ -942,14 +1236,20 @@ def _run_browser_command(
     ] + args
     
     try:
-        # Give each task its own socket directory to prevent concurrency conflicts.
-        # Without this, parallel workers fight over the same default socket path,
-        # causing "Failed to create socket directory: Permission denied" errors.
-        task_socket_dir = os.path.join(
-            _socket_safe_tmpdir(),
-            f"agent-browser-{session_info['session_name']}"
-        )
-        os.makedirs(task_socket_dir, mode=0o700, exist_ok=True)
+        # Socket directory strategy:
+        # - CDP sessions: all share one daemon via _get_cdp_shared_socket_dir()
+        #   so that ``tab <N>`` state persists across tasks.
+        # - Local sessions: each task gets its own daemon/socket to prevent
+        #   "Permission denied" races between parallel workers.
+        is_cdp = bool(session_info.get("cdp_url"))
+        if is_cdp:
+            task_socket_dir = _get_cdp_shared_socket_dir()
+        else:
+            task_socket_dir = os.path.join(
+                _socket_safe_tmpdir(),
+                f"agent-browser-{session_info['session_name']}"
+            )
+            os.makedirs(task_socket_dir, mode=0o700, exist_ok=True)
         logger.debug("browser cmd=%s task=%s socket_dir=%s (%d chars)",
                      command, task_id, task_socket_dir, len(task_socket_dir))
         
@@ -975,6 +1275,60 @@ def _run_browser_command(
         browser_env["PATH"] = ":".join(path_parts)
         browser_env["AGENT_BROWSER_SOCKET_DIR"] = task_socket_dir
         
+        # ── CDP tab isolation ──────────────────────────────────────────
+        # When sharing one Chrome via CDP, each task owns a dedicated tab
+        # identified by its DevTools target ID (stable across reorderings).
+        # Before every command we resolve that ID to a current numeric index
+        # and switch to it so the daemon operates on the right page.
+        # The resolution, tab switch, and the actual command all run under
+        # _get_cdp_tab_lock() to prevent interleaving with other tasks.
+        cdp_tab_id = session_info.get("cdp_tab_id")
+        _cdp_lock_held = False  # track whether we need to release
+        if is_cdp and cdp_tab_id and command not in ("tab", "close"):
+            _get_cdp_tab_lock().acquire()
+            _cdp_lock_held = True
+            try:
+                cdp_tab_index = _cdp_resolve_tab_index(session_info["cdp_url"], cdp_tab_id)
+                if cdp_tab_index is None:
+                    _get_cdp_tab_lock().release()
+                    _cdp_lock_held = False
+                    logger.error("CDP tab %s no longer exists for task %s", cdp_tab_id, task_id)
+                    return {"success": False, "error": "Browser tab no longer exists (closed externally?)"}
+                tab_cmd = cmd_prefix + backend_args + ["--json", "tab", str(cdp_tab_index)]
+                tab_stdout_path = os.path.join(task_socket_dir, "_stdout_tab_switch")
+                tab_stderr_path = os.path.join(task_socket_dir, "_stderr_tab_switch")
+                tab_stdout_fd = os.open(tab_stdout_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                tab_stderr_fd = os.open(tab_stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                try:
+                    tab_proc = subprocess.Popen(
+                        tab_cmd, stdout=tab_stdout_fd, stderr=tab_stderr_fd,
+                        stdin=subprocess.DEVNULL, env=browser_env,
+                    )
+                finally:
+                    os.close(tab_stdout_fd)
+                    os.close(tab_stderr_fd)
+                try:
+                    tab_proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    tab_proc.kill()
+                    tab_proc.wait()
+                    logger.warning("CDP tab switch timed out for task=%s tab=%s",
+                                   task_id, cdp_tab_id)
+                # Clean up tab switch temp files
+                for p in (tab_stdout_path, tab_stderr_path):
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
+                # NOTE: _cdp_tab_lock is released AFTER the main command below
+                # to prevent another task from switching tabs between our
+                # tab-switch and command execution.  See the finally block below.
+            except Exception:
+                if _cdp_lock_held:
+                    _get_cdp_tab_lock().release()
+                    _cdp_lock_held = False
+                raise
+
         # Use temp files for stdout/stderr instead of pipes.
         # agent-browser starts a background daemon that inherits file
         # descriptors.  With capture_output=True (pipes), the daemon keeps
@@ -1004,6 +1358,15 @@ def _run_browser_command(
             logger.warning("browser '%s' timed out after %ds (task=%s, socket_dir=%s)",
                            command, timeout, task_id, task_socket_dir)
             return {"success": False, "error": f"Command timed out after {timeout} seconds"}
+        finally:
+            # Release the CDP tab lock now that the command has finished
+            # (or timed out).  The lock was acquired before the tab switch
+            # and held through the main command to prevent interleaving.
+            if _cdp_lock_held:
+                try:
+                    _get_cdp_tab_lock().release()
+                except RuntimeError:
+                    pass  # already released (shouldn't happen)
 
         with open(stdout_path, "r") as f:
             stdout = f.read()
@@ -2038,12 +2401,54 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
         # Stop auto-recording before closing (saves the file)
         _maybe_stop_recording(task_id)
         
-        # Try to close via agent-browser first (needs session in _active_sessions)
-        try:
-            _run_browser_command(task_id, "close", [], timeout=10)
-            logger.debug("agent-browser close command completed for task %s", task_id)
-        except Exception as e:
-            logger.warning("agent-browser close failed for task %s: %s", task_id, e)
+        # ── CDP tab cleanup ────────────────────────────────────────────
+        # For CDP sessions sharing one Chrome, we close only our dedicated
+        # tab (NOT the whole daemon).  We also refuse to close the *last*
+        # remaining tab — doing so kills the Chrome process and breaks the
+        # CDP endpoint for everyone.
+        cdp_tab_id = session_info.get("cdp_tab_id")
+        if session_info.get("cdp_url") and cdp_tab_id:
+            try:
+                cdp_url = session_info["cdp_url"]
+                host_port = _cdp_host_port(cdp_url)
+                if host_port:
+                    # Count remaining tabs to avoid closing the last one
+                    can_close = True
+                    try:
+                        tabs_resp = requests.get(
+                            f"http://{host_port}/json/list", timeout=5)
+                        tabs = [t for t in tabs_resp.json()
+                                if t.get("type") == "page"]
+                        if len(tabs) <= 1:
+                            can_close = False
+                            logger.info(
+                                "CDP cleanup: skipping tab close for task %s "
+                                "(last tab, would kill Chrome)", task_id)
+                    except Exception:
+                        pass  # if we can't enumerate, err on the side of closing
+
+                    if can_close:
+                        # Close tab directly via DevTools HTTP API using its target ID
+                        try:
+                            requests.put(
+                                f"http://{host_port}/json/close/{cdp_tab_id}",
+                                timeout=5)
+                            logger.info(
+                                "CDP cleanup: closed tab %s for task %s",
+                                cdp_tab_id, task_id)
+                        except Exception as tab_exc:
+                            logger.warning(
+                                "CDP tab close failed for task %s: %s",
+                                task_id, tab_exc)
+            except Exception as e:
+                logger.warning("CDP cleanup failed for task %s: %s", task_id, e)
+        else:
+            # Non-CDP: close via agent-browser (kills the local daemon)
+            try:
+                _run_browser_command(task_id, "close", [], timeout=10)
+                logger.debug("agent-browser close command completed for task %s", task_id)
+            except Exception as e:
+                logger.warning("agent-browser close failed for task %s: %s", task_id, e)
         
         # Now remove from tracking under lock
         with _cleanup_lock:
@@ -2059,21 +2464,24 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
                 except Exception as e:
                     logger.warning("Could not close cloud browser session: %s", e)
         
-        # Kill the daemon process and clean up socket directory
-        session_name = session_info.get("session_name", "")
-        if session_name:
-            socket_dir = os.path.join(_socket_safe_tmpdir(), f"agent-browser-{session_name}")
-            if os.path.exists(socket_dir):
-                # agent-browser writes {session}.pid in the socket dir
-                pid_file = os.path.join(socket_dir, f"{session_name}.pid")
-                if os.path.isfile(pid_file):
-                    try:
-                        daemon_pid = int(Path(pid_file).read_text().strip())
-                        os.kill(daemon_pid, signal.SIGTERM)
-                        logger.debug("Killed daemon pid %s for %s", daemon_pid, session_name)
-                    except (ProcessLookupError, ValueError, PermissionError, OSError):
-                        logger.debug("Could not kill daemon pid for %s (already dead or inaccessible)", session_name)
-                shutil.rmtree(socket_dir, ignore_errors=True)
+        # Kill the daemon process and clean up socket directory.
+        # CDP sessions share a single daemon — do NOT kill it when cleaning
+        # up an individual task; only non-CDP sessions get daemon+dir cleanup.
+        if not session_info.get("cdp_url"):
+            session_name = session_info.get("session_name", "")
+            if session_name:
+                socket_dir = os.path.join(_socket_safe_tmpdir(), f"agent-browser-{session_name}")
+                if os.path.exists(socket_dir):
+                    # agent-browser writes {session}.pid in the socket dir
+                    pid_file = os.path.join(socket_dir, f"{session_name}.pid")
+                    if os.path.isfile(pid_file):
+                        try:
+                            daemon_pid = int(Path(pid_file).read_text().strip())
+                            os.kill(daemon_pid, signal.SIGTERM)
+                            logger.debug("Killed daemon pid %s for %s", daemon_pid, session_name)
+                        except (ProcessLookupError, ValueError, PermissionError, OSError):
+                            logger.debug("Could not kill daemon pid for %s (already dead or inaccessible)", session_name)
+                    shutil.rmtree(socket_dir, ignore_errors=True)
         
         logger.debug("Removed task %s from active sessions", task_id)
     else:
