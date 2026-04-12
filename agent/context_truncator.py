@@ -166,10 +166,9 @@ class ContextTruncator(ContextEngine):
         if n <= 2:
             return messages
 
-        display_tokens = (
-            current_tokens or self.last_prompt_tokens
-            or estimate_messages_tokens_rough(messages)
-        )
+        real_tokens = current_tokens or self.last_prompt_tokens or 0
+        rough_tokens_original = estimate_messages_tokens_rough(messages)
+        display_tokens = real_tokens or rough_tokens_original
 
         # Phase 1: Prune old tool result bodies (cheap pre-pass).
         # Prune everything except the last protect_last_n messages.
@@ -183,10 +182,48 @@ class ContextTruncator(ContextEngine):
             rest_start = 1
 
         system_tokens = sum(_estimate_msg_tokens(m) for m in system_msgs)
-        tail_budget = self.target_tokens - system_tokens
+
+        # Calibrate the tail budget using real API token counts.
+        #
+        # The rough estimator (len(content)//4) consistently underestimates
+        # real token usage by 1.3-2x because it ignores tool schemas, message
+        # framing, JSON structure tokens, and tokenizer overhead.  When the
+        # API reports 60K real tokens but the estimator says 37K, the budget
+        # check thinks all messages fit and drops nothing — causing an
+        # infinite compression loop.
+        #
+        # Fix: when real_tokens is available, compute the ratio using the
+        # ORIGINAL (pre-prune) rough estimate against real tokens, then
+        # scale the budget DOWN so the estimator-based walk drops enough
+        # messages to actually reach the target in real-token terms.
+        #
+        # We use the original rough estimate for calibration (not pruned)
+        # because pruning can drastically reduce estimates while the real
+        # API tokens were measured pre-prune.  The calibration ratio
+        # captures the systematic estimator bias, not the pruning delta.
+        calibration = 1.0
+        if real_tokens > 0 and rough_tokens_original > 0:
+            calibration = real_tokens / rough_tokens_original
+            # Clamp to reasonable range (0.8x - 4x) to avoid pathological
+            # values from stale or mismatched token counts.
+            # Floor of 0.8 because the estimator almost never OVERestimates.
+            calibration = max(0.8, min(calibration, 4.0))
+
+        # Scale target down by calibration: if real tokens are 1.6x the
+        # estimate, we need to keep only target/1.6 estimated tokens so
+        # the real result lands at the target.
+        calibrated_target = self.target_tokens / calibration if calibration > 0 else self.target_tokens
+        tail_budget = calibrated_target - system_tokens
         if tail_budget < 1000:
             # System prompt is huge — give at least 1000 tokens to tail
             tail_budget = 1000
+
+        logger.debug(
+            "Truncation budget: real=%d rough_orig=%d calibration=%.2f "
+            "target=%d calibrated_target=%d tail_budget=%d",
+            real_tokens, rough_tokens_original, calibration,
+            self.target_tokens, int(calibrated_target), int(tail_budget),
+        )
 
         # Phase 3: Walk backward, filling tail budget
         tail_start = len(pruned_messages)
@@ -209,7 +246,13 @@ class ContextTruncator(ContextEngine):
         # Count what we're dropping
         dropped = tail_start - rest_start
         if dropped <= 0:
-            # Nothing to drop
+            # Nothing to drop via truncation, but pruning may have helped.
+            # Return pruned_messages (with tool results replaced by
+            # placeholders) instead of the originals so the token savings
+            # from pruning are not discarded.
+            if pruned_messages is not messages:
+                self.compression_count += 1
+                return pruned_messages
             return messages
 
         # Phase 5: Assemble result
