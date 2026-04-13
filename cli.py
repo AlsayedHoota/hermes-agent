@@ -1059,14 +1059,55 @@ def _rich_text_from_ansi(text: str) -> _RichText:
     return _RichText.from_ansi(text or "")
 
 
+# Module-level reference to the active HermesCLI instance.
+# Set once in HermesCLI.__init__; used by _cprint to auto-suppress the
+# status bar during writes and debounce its restoration.
+_active_cli_ref = None
+# Timer handle for the debounced status-bar restore.  Stored at module
+# level so _cprint (a module-level function) can cancel/reschedule it
+# without needing a reference to 'self'.
+_status_bar_restore_timer = None
+
+
 def _cprint(text: str):
     """Print ANSI-colored text through prompt_toolkit's native renderer.
 
     Raw ANSI escapes written via print() are swallowed by patch_stdout's
     StdoutProxy.  Routing through print_formatted_text(ANSI(...)) lets
     prompt_toolkit parse the escapes and render real colors.
+
+    To prevent the prompt_toolkit bottom-bar (status bar) from bleeding
+    into content when rendered through tmux -> PTY -> xterm.js, this
+    function temporarily hides the status bar before each write and
+    schedules a debounced restore 150ms after the last write.  During
+    rapid-fire streaming the bar stays hidden; when output pauses the
+    bar reappears automatically.
     """
+    global _status_bar_restore_timer
+    cli = _active_cli_ref
+    if cli is not None and cli._status_bar_user_pref:
+        # Cancel any pending restore — we're about to write again.
+        if _status_bar_restore_timer is not None:
+            _status_bar_restore_timer.cancel()
+            _status_bar_restore_timer = None
+        # Hide the bar before writing so prompt_toolkit's repaint
+        # doesn't include the bottom toolbar in the PTY output.
+        cli._status_bar_visible = False
+
     _pt_print(_PT_ANSI(text))
+
+    if cli is not None and cli._status_bar_user_pref:
+        # Schedule a debounced restore.  If another _cprint fires within
+        # 150ms the timer is cancelled and rescheduled above.
+        def _restore():
+            global _status_bar_restore_timer
+            _status_bar_restore_timer = None
+            if cli._status_bar_user_pref:
+                cli._status_bar_visible = True
+                cli._invalidate()
+        _status_bar_restore_timer = threading.Timer(0.15, _restore)
+        _status_bar_restore_timer.daemon = True
+        _status_bar_restore_timer.start()
 
 
 # ---------------------------------------------------------------------------
@@ -6894,6 +6935,14 @@ class HermesCLI:
             except Exception:
                 pass
 
+        # Temporarily restore the status bar while waiting for user input.
+        # The turn-level _suppress_status_bar() at the top of the agent turn
+        # keeps the bar hidden during streaming, but clarify waits are idle
+        # pauses where the user needs to see the bar (context %, model, etc.).
+        # Re-suppressed after the response arrives so tool execution resumes
+        # with the bar hidden (prevents bleeding into tmux/xterm.js output).
+        self._restore_status_bar()
+
         # Poll for the user's response.  The countdown in the hint line
         # updates on each invalidate — but frequent repaints cause visible
         # flicker in some terminals (Kitty, ghostty).  We only refresh the
@@ -6911,6 +6960,9 @@ class HermesCLI:
                     _q_short += "..."
                 _cprint(f"  {_DIM}Q: {_q_short}{_RST}")
                 _cprint(f"  {_q_color}A: {result}{_RST}\n")
+                # Re-suppress the status bar for the rest of the agent turn.
+                # Matches the _restore_status_bar() before the wait loop.
+                self._suppress_status_bar()
                 return result
             except queue.Empty:
                 remaining = self._clarify_deadline - _time.monotonic()
@@ -6932,6 +6984,9 @@ class HermesCLI:
         self._invalidate()
         _cprint(f"  {_DIM}Q: {_q_short}{_RST}")
         _cprint(f"  {_DIM}A: (timed out after {timeout}s — agent will decide){_RST}\n")
+        # Re-suppress the status bar for the rest of the agent turn.
+        # Matches the _restore_status_bar() before the wait loop.
+        self._suppress_status_bar()
         return (
             "The user did not provide a response within the time limit. "
             "Use your best judgement to make the choice and proceed."
@@ -6982,6 +7037,10 @@ class HermesCLI:
             except Exception:
                 pass
 
+        # Temporarily restore the status bar while waiting for user input
+        # (same pattern as _clarify_callback).
+        self._restore_status_bar()
+
         while True:
             try:
                 result = response_queue.get(timeout=1)
@@ -6993,6 +7052,7 @@ class HermesCLI:
                     _cprint(f"\n{_DIM}  ✓ Password received (cached for session){_RST}")
                 else:
                     _cprint(f"\n{_DIM}  ⏭ Skipped{_RST}")
+                self._suppress_status_bar()
                 return result
             except queue.Empty:
                 remaining = self._sudo_deadline - _time.monotonic()
@@ -7005,6 +7065,7 @@ class HermesCLI:
         self._restore_modal_input_snapshot()
         self._invalidate()
         _cprint(f"\n{_DIM}  ⏱ Timeout — continuing without sudo{_RST}")
+        self._suppress_status_bar()
         return ""
 
     def _approval_callback(self, command: str, description: str,
@@ -7063,6 +7124,10 @@ class HermesCLI:
                 except Exception:
                     pass
 
+            # Temporarily restore the status bar while waiting for user input
+            # (same pattern as _clarify_callback).
+            self._restore_status_bar()
+
             _last_countdown_refresh = _time.monotonic()
             while True:
                 try:
@@ -7070,6 +7135,7 @@ class HermesCLI:
                     self._approval_state = None
                     self._approval_deadline = 0
                     self._invalidate()
+                    self._suppress_status_bar()
                     return result
                 except queue.Empty:
                     remaining = self._approval_deadline - _time.monotonic()
@@ -7084,6 +7150,7 @@ class HermesCLI:
             self._approval_deadline = 0
             self._invalidate()
             _cprint(f"\n{_DIM}  ⏱ Timeout — denying command{_RST}")
+            self._suppress_status_bar()
             return "deny"
 
     def _approval_choices(self, command: str, *, allow_permanent: bool = True) -> list[str]:

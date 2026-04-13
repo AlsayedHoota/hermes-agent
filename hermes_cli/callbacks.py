@@ -124,6 +124,17 @@ def prompt_for_secret(cli, var_name: str, prompt: str, metadata=None) -> dict:
     if hasattr(cli, "_app") and cli._app:
         cli._app.invalidate()
 
+    # Temporarily restore the status bar while waiting for user input
+    # (same pattern as _clarify_callback / _approval_callback in cli.py).
+    _did_restore_bar = False
+    if hasattr(cli, "_restore_status_bar"):
+        cli._restore_status_bar()
+        _did_restore_bar = True
+
+    def _re_suppress():
+        if _did_restore_bar and hasattr(cli, "_suppress_status_bar"):
+            cli._suppress_status_bar()
+
     while True:
         try:
             value = response_queue.get(timeout=1)
@@ -134,6 +145,7 @@ def prompt_for_secret(cli, var_name: str, prompt: str, metadata=None) -> dict:
 
             if not value:
                 cprint(f"\n{_DIM}  ⏭ Secret entry cancelled{_RST}")
+                _re_suppress()
                 return {
                     "success": True,
                     "reason": "cancelled",
@@ -146,6 +158,7 @@ def prompt_for_secret(cli, var_name: str, prompt: str, metadata=None) -> dict:
             stored = save_env_value_secure(var_name, value)
             _dhh = display_hermes_home()
             cprint(f"\n{_DIM}  ✓ Stored secret in {_dhh}/.env as {var_name}{_RST}")
+            _re_suppress()
             return {
                 **stored,
                 "skipped": False,
@@ -173,6 +186,7 @@ def prompt_for_secret(cli, var_name: str, prompt: str, metadata=None) -> dict:
     if hasattr(cli, "_app") and cli._app:
         cli._app.invalidate()
     cprint(f"\n{_DIM}  ⏱ Timeout — secret capture cancelled{_RST}")
+    _re_suppress()
     return {
         "success": True,
         "reason": "timeout",
@@ -219,6 +233,13 @@ def approval_callback(cli, command: str, description: str) -> str:
         if hasattr(cli, "_app") and cli._app:
             cli._app.invalidate()
 
+        # Temporarily restore the status bar while waiting for user input
+        # (same pattern as _clarify_callback in cli.py).
+        _did_restore_bar = False
+        if hasattr(cli, "_restore_status_bar"):
+            cli._restore_status_bar()
+            _did_restore_bar = True
+
         while True:
             try:
                 result = response_queue.get(timeout=1)
@@ -226,6 +247,8 @@ def approval_callback(cli, command: str, description: str) -> str:
                 cli._approval_deadline = 0
                 if hasattr(cli, "_app") and cli._app:
                     cli._app.invalidate()
+                if _did_restore_bar and hasattr(cli, "_suppress_status_bar"):
+                    cli._suppress_status_bar()
                 return result
             except queue.Empty:
                 remaining = cli._approval_deadline - _time.monotonic()
@@ -239,4 +262,6 @@ def approval_callback(cli, command: str, description: str) -> str:
         if hasattr(cli, "_app") and cli._app:
             cli._app.invalidate()
         cprint(f"\n{_DIM}  ⏱ Timeout — denying command{_RST}")
+        if _did_restore_bar and hasattr(cli, "_suppress_status_bar"):
+            cli._suppress_status_bar()
         return "deny"
